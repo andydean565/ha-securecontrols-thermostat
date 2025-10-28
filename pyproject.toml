@@ -1,0 +1,18 @@
+[project]
+name = "ha-securecontrols-thermo"
+version = "0.1.0"
+description = "Home Assistant custom integration for Secure Controls thermostats"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E","F","I","UP","B","BLE","SIM","PL","RUF"]
+ignore = ["PLR0913","PLR0912","PLR0915"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+

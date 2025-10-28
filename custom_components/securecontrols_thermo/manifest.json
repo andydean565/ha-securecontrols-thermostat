@@ -2,10 +2,10 @@
   "domain": "securecontrols_thermo",
   "name": "Secure Controls Thermostat",
   "codeowners": [
-    "@your-gh-handle"
+    "@andydean565"
   ],
-  "documentation": "https://github.com/your/repo",
-  "issue_tracker": "https://github.com/your/repo/issues",
+  "documentation": "https://github.com/andydean565/securecontrols_thermo",
+  "issue_tracker": "https://github.com/andydean565/securecontrols_thermo/issues",
   "iot_class": "cloud_polling",
   "integration_type": "hub",
   "version": "0.1.0",

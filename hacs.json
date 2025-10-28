@@ -1,0 +1,11 @@
+{
+  "name": "Secure Controls Thermostat",
+  "content_in_root": false,
+  "render_readme": true,
+  "country": [
+    "GB",
+    "IE",
+    "EU"
+  ],
+  "homeassistant": "2024.6.0"
+}
