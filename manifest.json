@@ -1,0 +1,17 @@
+{
+  "domain": "securecontrols_thermo",
+  "name": "Secure Controls Thermostat",
+  "codeowners": [
+    "@your-gh-handle"
+  ],
+  "documentation": "https://github.com/your/repo",
+  "issue_tracker": "https://github.com/your/repo/issues",
+  "iot_class": "cloud_polling",
+  "integration_type": "hub",
+  "version": "0.1.0",
+  "config_flow": true,
+  "loggers": [
+    "securecontrols_thermo"
+  ],
+  "requirements": []
+}

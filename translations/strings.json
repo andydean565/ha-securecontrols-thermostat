@@ -1,0 +1,14 @@
+{
+  "title": "Secure Controls Thermostat",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to Secure Controls",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    }
+  }
+}

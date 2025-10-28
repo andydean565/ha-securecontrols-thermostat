@@ -1,0 +1,19 @@
+{
+  "title": "Secure Controls Thermostat",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to Secure Controls",
+        "description": "Enter the email and password you use in the Secure Controls app.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "auth": "Login failed. Check your credentials.",
+      "no_devices": "No thermostats found in this account."
+    }
+  }
+}
