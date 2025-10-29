@@ -82,7 +82,12 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
     def target_temperature(self) -> Optional[float]:
         s = self.coordinator.data or {}
         return s.get("target_c")
-
+    
+    @property
+    def current_humidity(self) -> Optional[float]:
+        s = self.coordinator.data or {}
+        return s.get("humidity")
+    
     @property
     def preset_mode(self) -> str:
         # Not implementing presets yet; expose "none" to keep UX simple
