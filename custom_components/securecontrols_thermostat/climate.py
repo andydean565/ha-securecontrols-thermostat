@@ -29,7 +29,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity):
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_hvac_modes = []
+    _attr_hvac_modes = [HVACMode.OFF]
     _attr_preset_modes = [PRESET_HOME, PRESET_AWAY]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
@@ -103,8 +103,8 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
             # Push updates will arrive via WS; still request a refresh as a fallback
             await self.coordinator.async_request_refresh()
 
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        on = hvac_mode == HVACMode.HEAT
+    async def async_handle_set_preset_mode_service(self, preset_mode: str) -> None:
+        on = preset_mode == PRESET_HOME
         await self.client.set_mode(on)
         await self.coordinator.async_request_refresh()
 

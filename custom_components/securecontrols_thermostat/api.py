@@ -407,7 +407,7 @@ class SecureControlsClient:
         # I:6 (0=Off, 2=On)
         return await self._send_request(
             hi=2, si=15,
-            args=[1, {"I": 6, "V": (2 if on else 0), "OT": 1, "D": 0}]
+            args=[1, {"I": 6, "V": (2 if on else 1), "OT": 1, "D": 0}]
         )
 
     async def set_timed_hold(self, celsius: float, minutes: int) -> Any:
