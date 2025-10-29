@@ -29,6 +29,19 @@ class Thermostat:
     dn: Optional[str] = None
 
 
+class ApiError(Exception):
+    pass
+
+class InvalidAuth(ApiError):
+    pass
+
+class CannotConnect(ApiError):
+    pass
+
+def _encode_password(pw: str) -> str:
+    # Beanbag expects SHA1(password) hex, truncated to 32 chars
+    return hashlib.sha1(pw.encode("utf-8")).hexdigest()[:32]
+
 class SecureControlsClient:
     """
     Secure Controls / Beanbag client
@@ -86,35 +99,57 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
-        sha1_hash = hashlib.sha1(password.encode("utf-8")).hexdigest()[:32]
-        payload = {"ULC": {"OI": 1550005, "NT": "SetLogin", "UEI": email, "P": sha1_hash}}
-        resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
-        resp.raise_for_status()
-        root = await resp.json()
-        d = root.get("D", {})
+        payload = {
+            "ULC": {
+                "OI": 1550005,
+                "NT": "SetLogin",
+                "UEI": email,
+                "P": _encode_password(password),
+            }
+        }
+        try:
+            resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
+        except aiohttp.ClientError as e:
+            raise CannotConnect(f"HTTP error connecting: {e}") from e
 
-        self._jwt = d.get("JT")
+        # Map status first (many backends return 200 + error body though)
+        if resp.status in (401, 403):
+            raise InvalidAuth("HTTP unauthorized/forbidden")
+        if resp.status >= 500:
+            raise CannotConnect(f"Server error: {resp.status}")
+
+        try:
+            root = await resp.json()
+        except Exception as e:
+            raise CannotConnect(f"Bad JSON from login: {e}") from e
+
+        d = root.get("D") or {}
+        jwt = d.get("JT")
+        si = d.get("SI")
+        gd = d.get("GD") or []
+
+        if not jwt or not si:
+            # Some backends return RI/error fields. If present, expose them for logs.
+            ri = root.get("RI")
+            raise InvalidAuth(f"Missing JT/SI in response (RI={ri})")
+
+        self._jwt = jwt
+        self._session_id = si
         self._session_ts = d.get("JTT")
         self._user_id = d.get("UI")
-        self._session_id = d.get("SI")
 
-        if not self._jwt or not self._session_id:
-            raise RuntimeError("Login missing JT or SI")
-
-        gd = d.get("GD") or []
         if not gd:
-            raise RuntimeError("No thermostats in GD")
+            # Not strictly auth failure, but fail the flow with a clear reason later.
+            raise ApiError("Login ok but no devices (GD empty)")
 
+        # select first thermostat (= gateway)
         gw = gd[0]
         self.thermostat = Thermostat(
             gmi=str(gw["GMI"]),
             sn=str(gw["SN"]),
             hn=str(gw["HN"]),
-            cs=gw.get("CS"),
-            ur=gw.get("UR"),
-            hi=gw.get("HI"),
-            dt=gw.get("DT"),
-            dn=gw.get("DN"),
+            cs=gw.get("CS"), ur=gw.get("UR"),
+            hi=gw.get("HI"), dt=gw.get("DT"), dn=gw.get("DN"),
         )
 
     # --------------- WebSocket lifecycle ---------------
