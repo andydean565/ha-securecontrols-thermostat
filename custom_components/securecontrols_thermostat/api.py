@@ -66,7 +66,6 @@ def _encode_password(pw: str) -> str:
     if len(digest) != 32 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("Password digest must be a 32-character lowercase hex string")
     # Log cautiously: show only prefix/suffix
-    _LOGGER.warning("Login digest (md5): %s…%s", digest[:6], digest[-6:])
     return digest
 
 
@@ -130,16 +129,12 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
-        """
-        Perform login:
-          - P = SHA1(password).hexdigest()[:32]
-          - UEI = email as provided (trimmed; do NOT lowercase)
-        """
+        
         payload = {
             "ULC": {
                 "OI": 1550005,
                 "NT": "SetLogin",
-                "UEI": email.strip(),          # do not .lower()
+                "UEI": email.strip(),         
                 "P": _encode_password(password),
             }
         }
@@ -150,8 +145,6 @@ class SecureControlsClient:
             "Request-id": "1",
         }
         
-        _LOGGER.warning("SecureControls: LoginRequest UEI=%r", payload["ULC"]["UEI"])
-
         try:
             resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload, headers=headers)
         except aiohttp.ClientError as e:
