@@ -1,19 +1,23 @@
 {
   "domain": "securecontrols_thermostat",
   "name": "Secure Controls Thermostat",
+  "version": "0.1.0",
+  "config_flow": true,
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "documentation": "https://github.com/andydean565/ha-securecontrols-thermostat",
+  "issue_tracker": "https://github.com/andydean565/ha-securecontrols-thermostat/issues",
+  "icon": "assets/icon.png",
+  "logo": "assets/icon.png",
   "codeowners": [
     "@andydean565"
   ],
-  "documentation": "https://github.com/andydean565/ha-securecontrols-thermostat",
-  "issue_tracker": "https://github.com/andydean565/ha-securecontrols-thermostat/issues",
-  "iot_class": "cloud_polling",
-  "integration_type": "hub",
-  "version": "0.1.0",
-  "config_flow": true,
-  "icon": "assets/icon.png",
-  "logo": "assets/icon.png",
-  "loggers": [
-    "securecontrols_thermostat"
+  "platforms": [
+    "climate",
+    "sensor"
   ],
-  "requirements": []
+  "requirements": [],
+  "loggers": [
+    "custom_components.securecontrols_thermostat"
+  ]
 }
