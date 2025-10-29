@@ -4,8 +4,8 @@
   "codeowners": [
     "@andydean565"
   ],
-  "documentation": "https://github.com/andydean565/securecontrols_thermo",
-  "issue_tracker": "https://github.com/andydean565/securecontrols_thermo/issues",
+  "documentation": "https://github.com/andydean565/ha-securecontrols-thermostat",
+  "issue_tracker": "https://github.com/andydean565/ha-securecontrols-thermostat/issues",
   "iot_class": "cloud_polling",
   "integration_type": "hub",
   "version": "0.1.0",

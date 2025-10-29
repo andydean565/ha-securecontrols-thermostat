@@ -1,4 +1,4 @@
-from custom_components.securecontrols_thermo.api import SecureControlsClient
+from custom_components.securecontrols_thermostat.api import SecureControlsClient
 import pytest
 import aiohttp
 import asyncio

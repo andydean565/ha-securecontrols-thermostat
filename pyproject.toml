@@ -1,5 +1,5 @@
 [project]
-name = "ha-securecontrols-thermo"
+name = "ha-securecontrols-thermostat"
 version = "0.1.0"
 description = "Home Assistant custom integration for Secure Controls thermostats"
 readme = "README.md"
