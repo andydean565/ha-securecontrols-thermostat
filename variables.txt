@@ -1,15 +1,11 @@
-1 = requested target temp
-2 = current actual temp
-3
+1 = target_c
+2 = ambient_c
+3 = hvac (0 = off, 1 = heat)
 4
 5
-6
+6 = presets (1 = away, 2 = home)
 7
-8 ? 51, 
-9 ? 360, 
-10 ? 200, 
-
-options 
-
-OT = 0 passive / 1 user action / timed actions
-D = duration
+8 = humidity, 
+9 = next scheduled time
+10 = next scheduled target temp, 
+11 = frost_c

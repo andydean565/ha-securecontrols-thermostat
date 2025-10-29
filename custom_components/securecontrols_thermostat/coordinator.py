@@ -11,14 +11,15 @@ from .const import DOMAIN, UPDATE_INTERVAL_SECS
 
 _LOGGER = logging.getLogger(__name__)
 
-# Item map (SI:15, slot 1)
-ITEM_TARGET = 1
-ITEM_POWER = 6
-ITEM_PROBE = 2
-ITEM_HUMID = 8
-ITEM_NEXT_TIME = 9
-ITEM_NEXT_VALUE = 10
-ITEM_FROST = 11
+# Item map for block SI:15
+ITEM_TARGET = 1           # target_c
+ITEM_AMBIENT = 2          # ambient_c (probe)
+ITEM_HVAC = 3             # hvac (0 = off, 1 = heat)
+ITEM_PRESET = 6           # presets (1 = away, 2 = home)
+ITEM_HUMID = 8            # humidity
+ITEM_NEXT_TIME = 9        # next scheduled time (mins)
+ITEM_NEXT_VALUE = 10      # next scheduled target temp
+ITEM_FROST = 11           # frost_c
 
 
 class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
@@ -79,13 +80,15 @@ class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         Shape of R: {"V":[{"I":<slot>,"SI":<block>,"V":[{I,V,OT,D},...],"S":0},...]}
         """
         state: Dict[str, Any] = {
-            "power": None,            # 0=Off, 2=On
+            # previously "power" (0 Off / 2 On); now accurate HVAc flag (0 Off / 1 Heat)
+            "hvac": None,             # int: 0=off, 1=heat
+            "preset": None,           # str: "away" | "home"
             "target_c": None,         # float
             "ambient_c": None,        # float
             "humidity": None,         # %
-            "next_change_mins": None,
-            "next_target_c": None,
-            "frost_c": None,
+            "next_change_mins": None, # int minutes
+            "next_target_c": None,    # float
+            "frost_c": None,          # float
         }
 
         if not isinstance(r, dict):
@@ -102,16 +105,19 @@ class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                     continue
                 iid = it.get("I")
                 val = it.get("V")
-                if iid == ITEM_POWER:
-                    state["power"] = int(val)
+
+                if iid == ITEM_HVAC:
+                    state["hvac"] = self._int_or_none(val)
+                elif iid == ITEM_PRESET:
+                    state["preset"] = self._preset_name(self._int_or_none(val))
                 elif iid == ITEM_TARGET:
                     state["target_c"] = self._deci_to_c(val)
-                elif iid == ITEM_PROBE:
+                elif iid == ITEM_AMBIENT:
                     state["ambient_c"] = self._maybe_deci_temp(val)
                 elif iid == ITEM_HUMID:
-                    state["humidity"] = int(val)
+                    state["humidity"] = self._int_or_none(val)
                 elif iid == ITEM_NEXT_TIME:
-                    state["next_change_mins"] = int(val)
+                    state["next_change_mins"] = self._int_or_none(val)
                 elif iid == ITEM_NEXT_VALUE:
                     state["next_target_c"] = self._deci_to_c(val)
                 elif iid == ITEM_FROST:
@@ -127,24 +133,28 @@ class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         val = item.get("V")
         changed = False
 
-        if iid == ITEM_POWER:
-            newv = int(val)
-            changed = self._state_cache.get("power") != newv
-            self._state_cache["power"] = newv
+        if iid == ITEM_HVAC:
+            newv = self._int_or_none(val)
+            changed = self._state_cache.get("hvac") != newv
+            self._state_cache["hvac"] = newv
+        elif iid == ITEM_PRESET:
+            newv = self._preset_name(self._int_or_none(val))
+            changed = self._state_cache.get("preset") != newv
+            self._state_cache["preset"] = newv
         elif iid == ITEM_TARGET:
             newv = self._deci_to_c(val)
             changed = self._state_cache.get("target_c") != newv
             self._state_cache["target_c"] = newv
-        elif iid == ITEM_PROBE:
+        elif iid == ITEM_AMBIENT:
             newv = self._maybe_deci_temp(val)
             changed = self._state_cache.get("ambient_c") != newv
             self._state_cache["ambient_c"] = newv
         elif iid == ITEM_HUMID:
-            newv = int(val)
+            newv = self._int_or_none(val)
             changed = self._state_cache.get("humidity") != newv
             self._state_cache["humidity"] = newv
         elif iid == ITEM_NEXT_TIME:
-            newv = int(val)
+            newv = self._int_or_none(val)
             changed = self._state_cache.get("next_change_mins") != newv
             self._state_cache["next_change_mins"] = newv
         elif iid == ITEM_NEXT_VALUE:
@@ -158,7 +168,7 @@ class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         return changed
 
-    # ---------- unit helpers ----------
+    # ---------- unit & parse helpers ----------
 
     @staticmethod
     def _deci_to_c(v: Optional[int]) -> Optional[float]:
@@ -179,4 +189,19 @@ class ThermoCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             return None
         if -500 <= iv <= 5000:
             return iv / 10.0
+        return None
+
+    @staticmethod
+    def _int_or_none(v: Any) -> Optional[int]:
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _preset_name(code: Optional[int]) -> Optional[str]:
+        if code == 1:
+            return "away"
+        if code == 2:
+            return "home"
         return None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Awaitable, Callable, AsyncIterator
+from typing import Any, Dict, Optional, Awaitable, Callable, AsyncIterator, List, Union
 import aiohttp
 import asyncio
 import hashlib
@@ -23,6 +23,21 @@ UpdateHandler = Callable[[Json], Awaitable[None]]
 
 WS_URL = "wss://app.beanbag.online/api/TransactionRestAPI/ConnectWebSocket"
 WS_SUBPROTOCOL = "BB-BO-01"
+
+# Thermostat "block" constants (per your usage)
+THERMO_HI_WRITE = 2     # thermostat.state.write
+THERMO_SI = 15          # thermostat state block
+THERMO_SLOT = 1         # slot used in your integration
+
+# Item map (SI:15, slot 1) — updated
+ITEM_TARGET = 1           # target_c (deci °C)
+ITEM_AMBIENT = 2          # ambient_c (deci °C)
+ITEM_HVAC = 3             # hvac: 0=off, 1=heat
+ITEM_PRESET = 6           # preset: 1=away, 2=home
+ITEM_HUMID = 8            # %RH
+ITEM_NEXT_TIME = 9        # next schedule time (mins)
+ITEM_NEXT_TARGET = 10     # next scheduled target temp (deci °C)
+ITEM_FROST = 11           # frost_c (deci °C)
 
 
 # ---- Thermostat metadata (gateway == device) ----
@@ -62,10 +77,8 @@ def _encode_password(pw: str) -> str:
     (32 lowercase hex characters). Do NOT truncate.
     """
     digest = hashlib.md5(pw.encode("utf-8")).hexdigest()
-    # quick sanity check (matches what you tested)
     if len(digest) != 32 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("Password digest must be a 32-character lowercase hex string")
-    # Log cautiously: show only prefix/suffix
     return digest
 
 
@@ -111,7 +124,6 @@ class SecureControlsClient:
     # --------------- Utilities ---------------
     @staticmethod
     def _now_epoch() -> int:
-        # Field guide says epoch seconds (UTC)
         return int(time.time())
 
     @staticmethod
@@ -123,35 +135,30 @@ class SecureControlsClient:
         return float(v) / 10.0
 
     def _new_corr(self) -> str:
-        # "I": "{sessionId}-{rand32}"
         sid = str(self._session_id or "0")
         return f"{sid}-{secrets.token_hex(4)}"
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
-        
         payload = {
             "ULC": {
                 "OI": 1550005,
                 "NT": "SetLogin",
-                "UEI": email.strip(),         
+                "UEI": email.strip(),
                 "P": _encode_password(password),
             }
         }
-        
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json;charset=UTF-8",
             "Request-id": "1",
         }
-        
         try:
             resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload, headers=headers)
         except aiohttp.ClientError as e:
             _LOGGER.error("SecureControls: HTTP exception during login: %s", e)
             raise CannotConnect(f"HTTP error connecting: {e}") from e
 
-        # Fast-path status mapping (many backends still return 200+error body)
         if resp.status in (401, 403):
             _LOGGER.warning("SecureControls: login HTTP status %s (unauthorized/forbidden)", resp.status)
             raise InvalidAuth("HTTP unauthorized/forbidden")
@@ -159,7 +166,6 @@ class SecureControlsClient:
             _LOGGER.error("SecureControls: server error %s on login", resp.status)
             raise CannotConnect(f"Server error: {resp.status}")
 
-        # Parse JSON (or surface raw body on failure)
         try:
             root = await resp.json()
         except Exception:
@@ -173,7 +179,6 @@ class SecureControlsClient:
         gd = d.get("GD") or []
 
         if not jwt or not si:
-            # Log full response (trimmed) to help diagnose (RI often -1 on failure)
             _LOGGER.warning(
                 "SecureControls: login missing JT/SI. RI=%s, payload=%s",
                 root.get("RI"),
@@ -181,7 +186,6 @@ class SecureControlsClient:
             )
             raise InvalidAuth(f"Missing JT/SI in response (RI={root.get('RI')})")
 
-        # Save session/auth
         self._jwt = jwt
         self._session_id = si
         self._session_ts = d.get("JTT")
@@ -193,11 +197,9 @@ class SecureControlsClient:
         )
 
         if not gd:
-            # Not strictly auth failure, but tell the caller why we can’t continue.
             _LOGGER.error("SecureControls: login ok but no devices (GD empty)")
             raise ApiError("Login ok but no devices (GD empty)")
 
-        # Select first thermostat (= gateway)
         gw = gd[0]
         self.thermostat = Thermostat(
             gmi=str(gw["GMI"]),
@@ -216,11 +218,10 @@ class SecureControlsClient:
 
     # --------------- WebSocket lifecycle ---------------
     def _ws_headers(self) -> Dict[str, str]:
-        # Required headers per field guide
         return {
             "Authorization": f"Bearer {self._jwt}",
             "Session-id": str(self._session_id),
-            "Request-id": "1",  # any string; not strictly used after connect
+            "Request-id": "1",
         }
 
     async def connect(self) -> None:
@@ -238,7 +239,6 @@ class SecureControlsClient:
         )
         _LOGGER.debug("SecureControls: WebSocket connected (protocol=%s)", WS_SUBPROTOCOL)
 
-        # Start receiver & keepalive
         self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
         self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
 
@@ -262,7 +262,6 @@ class SecureControlsClient:
             await self._ws.close()
         self._ws = None
 
-        # Fail any pending requests
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(asyncio.CancelledError())
@@ -279,7 +278,6 @@ class SecureControlsClient:
                 _LOGGER.debug("SecureControls: non-JSON WS frame: %s", msg.data[:120])
                 continue
 
-            # Replies (to our requests)
             corr = payload.get("I")
             if corr and ("R" in payload or "E" in payload):
                 fut = self._pending.pop(corr, None)
@@ -291,7 +289,6 @@ class SecureControlsClient:
                         fut.set_exception(RuntimeError(payload.get("E")))
                 continue
 
-            # Push notifies
             if payload.get("M") == "Notify":
                 await self._dispatch_notify(payload)
                 continue
@@ -299,16 +296,15 @@ class SecureControlsClient:
             _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
 
     async def _keepalive_loop(self) -> None:
-        # Send time.tick (HI/SI = 2/103) periodically
         while not self._stop.is_set():
             try:
-                await self.time_tick()  # fire-and-forget is fine
+                await self.time_tick()
             except Exception as e:
                 _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
             await asyncio.wait_for(asyncio.sleep(self._keepalive_secs), timeout=None)
 
     # --------------- Envelope + send ---------------
-    async def _send_request(self, *, hi: int, si: int, args: Optional[list[Any]] = None) -> Any:
+    async def _send_request(self, *, hi: int, si: int, args: Optional[List[Any]] = None) -> Any:
         if not self._ws or self._ws.closed:
             raise RuntimeError("WebSocket not connected")
         if not self.thermostat:
@@ -333,7 +329,7 @@ class SecureControlsClient:
         _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
         return await fut
 
-    async def _send_fire_and_forget(self, *, hi: int, si: int, args: Optional[list[Any]] = None) -> None:
+    async def _send_fire_and_forget(self, *, hi: int, si: int, args: Optional[List[Any]] = None) -> None:
         if not self._ws or self._ws.closed:
             raise RuntimeError("WebSocket not connected")
         if not self.thermostat:
@@ -354,7 +350,6 @@ class SecureControlsClient:
 
     # --------------- Notify / push ---------------
     async def _dispatch_notify(self, payload: Json) -> None:
-        # Queue it
         try:
             self._updates_q.put_nowait(payload)
         except asyncio.QueueFull:
@@ -362,7 +357,6 @@ class SecureControlsClient:
                 _ = self._updates_q.get_nowait()
             await self._updates_q.put(payload)
 
-        # Call handlers
         for h in self._handlers:
             asyncio.create_task(h(payload))
 
@@ -394,28 +388,57 @@ class SecureControlsClient:
         # 3/1 → returns blocks with items
         return await self._send_request(hi=3, si=1)
 
+    # --------------- Generic writer helper ---------------
+    async def _write_item(self, item_id: int, value: int, *, ot: int = 1, d: int = 0) -> Any:
+        """
+        Write a single state item on SI:15 / slot 1.
+        ot: 1=immediate set, 2=timed override (minutes in D)
+        """
+        return await self._send_request(
+            hi=THERMO_HI_WRITE,
+            si=THERMO_SI,
+            args=[THERMO_SLOT, {"I": int(item_id), "V": int(value), "OT": int(ot), "D": int(d)}],
+        )
+
     # --------------- Writes (Thermostat SI:15, slot=1) ---------------
     async def set_target_temp(self, celsius: float) -> Any:
-        # thermostat.state.write — 2/15
-        # args: [ slot, { "I":1, "V":<deciC>, "OT":1, "D":0 } ]
-        return await self._send_request(
-            hi=2, si=15,
-            args=[1, {"I": 1, "V": self.c_to_deci(celsius), "OT": 1, "D": 0}]
-        )
+        # I:1 target (deci °C), OT:1 immediate
+        return await self._write_item(ITEM_TARGET, self.c_to_deci(celsius), ot=1, d=0)
 
     async def set_mode(self, on: bool) -> Any:
-        # I:6 (0=Off, 2=On)
-        return await self._send_request(
-            hi=2, si=15,
-            args=[1, {"I": 6, "V": (2 if on else 1), "OT": 1, "D": 0}]
-        )
+        """
+        Backward-compatible name used by the climate entity.
+        With the updated mapping, this toggles HVAC (I:3): 0=off, 1=heat.
+        """
+        hvac_val = 1 if on else 0
+        return await self._write_item(ITEM_HVAC, hvac_val, ot=1, d=0)
+
+    async def set_hvac(self, *, heat: bool) -> Any:
+        """Alias that makes intent explicit."""
+        return await self.set_mode(heat)
+
+    async def set_preset(self, preset: Union[str, int]) -> Any:
+        """
+        Set preset (I:6): 1=away, 2=home.
+        Accepts either 'away'/'home' (case-insensitive) or 1/2.
+        """
+        if isinstance(preset, str):
+            p = preset.strip().lower()
+            if p == "away":
+                code = 1
+            elif p == "home":
+                code = 2
+            else:
+                raise ValueError(f"Unsupported preset '{preset}' (expected 'away' or 'home')")
+        else:
+            code = int(preset)
+            if code not in (1, 2):
+                raise ValueError(f"Unsupported preset code {code} (expected 1 or 2)")
+        return await self._write_item(ITEM_PRESET, code, ot=1, d=0)
 
     async def set_timed_hold(self, celsius: float, minutes: int) -> Any:
-        # OT:2 with D:<minutes> on I:1
-        return await self._send_request(
-            hi=2, si=15,
-            args=[1, {"I": 1, "V": self.c_to_deci(celsius), "OT": 2, "D": int(minutes)}]
-        )
+        # Timed override on target (I:1, OT:2) for D:<minutes>
+        return await self._write_item(ITEM_TARGET, self.c_to_deci(celsius), ot=2, d=int(minutes))
 
     # --------------- Context manager ---------------
     async def __aenter__(self) -> "SecureControlsClient":

@@ -60,36 +60,6 @@ This integration enables real-time two-way communication with Secure thermostats
 
 ---
 
-## 🖼️ Branding
-
-This integration includes your company logo (`icon.png`) for branding.
-
-```
-custom_components/securecontrols_thermostat/
-├── __init__.py
-├── api.py
-├── climate.py
-├── manifest.json
-└── icon.png
-```
-
-✅ Tips:
-- `icon.png` — main integration icon (shown on “Devices & Services” tile)
-- `logo.png` (optional) — larger version for setup UI
-- Recommended size 256×256 or 512×512 PNG with transparent background
-
-You can also expose it as an entity picture by placing a copy under:
-```
-config/www/securecontrols_thermostat/icon.png
-```
-
-Then, in your entity code:
-```python
-self._attr_entity_picture = "/local/securecontrols_thermostat/icon.png"
-```
-
----
-
 ## 🧠 Technical Overview
 
 ### Authentication
@@ -120,8 +90,7 @@ Example telemetry payload:
   "ambient_c": 21.3,
   "target_c": 22.0,
   "humidity": 46.5,
-  "power": 120.0,
-  "heating_enabled": true
+  "power": 1,
 }
 ```
 
@@ -146,13 +115,12 @@ custom_components/securecontrols_thermostat/
 
 - 🔍 **API research & understanding** inspired by [ha-securemtr](https://github.com/ha-securemtr/ha-securemtr) —  
   their work on Secure Meters protocols was invaluable in decoding this API.
-- 🧑‍💻 Integration developed and maintained by **[Your Name or Company]**
 
 ---
 
 ## 🪪 License
 
-MIT License © 2025 [Your Name or Company]
+MIT License © 2025 andrew dean
 
 ---
 
