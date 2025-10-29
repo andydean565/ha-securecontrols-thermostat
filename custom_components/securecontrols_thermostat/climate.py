@@ -30,6 +30,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity):
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
     _attr_hvac_modes = [HVACMode.OFF]
+    _attr_hvac_mode = None
     _attr_preset_modes = [PRESET_HOME, PRESET_AWAY]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
