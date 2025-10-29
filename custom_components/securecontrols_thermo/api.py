@@ -6,15 +6,24 @@ import asyncio
 import hashlib
 import json
 import time
-import os
 import secrets
 import contextlib
+import logging
 
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
+_LOGGER = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------------------
+# Types / constants
+# --------------------------------------------------------------------------------------
 Json = Dict[str, Any]
 UpdateHandler = Callable[[Json], Awaitable[None]]
 
 WS_URL = "wss://app.beanbag.online/api/TransactionRestAPI/ConnectWebSocket"
 WS_SUBPROTOCOL = "BB-BO-01"
+
 
 # ---- Thermostat metadata (gateway == device) ----
 @dataclass
@@ -29,27 +38,37 @@ class Thermostat:
     dn: Optional[str] = None
 
 
+# --------------------------------------------------------------------------------------
+# Errors
+# --------------------------------------------------------------------------------------
 class ApiError(Exception):
     pass
+
 
 class InvalidAuth(ApiError):
     pass
 
+
 class CannotConnect(ApiError):
     pass
 
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
 def _encode_password(pw: str) -> str:
-    # Beanbag expects SHA1(password) hex, truncated to 32 chars
-    encoded =  hashlib.md5(pw.encode("utf-8")).hexdigest()
-    if len(encoded) != 32 or not all(
-            ch in "0123456789abcdefABCDEF" for ch in encoded
-        ):
-         raise ValueError(
-                "Password digest must be a 32-character hexadecimal string"
-            )
-    return encoded
+    """
+    Secure Controls / Beanbag expects: SHA1(password).hexdigest() truncated to 32 chars.
+    """
+    digest = hashlib.sha1(pw.encode("utf-8")).hexdigest()[:32]
+    # DEBUG: Log the digest (still sensitive; enable only in development)
+    _LOGGER.debug("SecureControls: computed password digest (SHA1[:32]) = %s", digest)
+    return digest
 
 
+# --------------------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------------------
 class SecureControlsClient:
     """
     Secure Controls / Beanbag client
@@ -83,7 +102,7 @@ class SecureControlsClient:
         self._updates_q: asyncio.Queue[Json] = asyncio.Queue(maxsize=200)
         self._handlers: list[UpdateHandler] = []
 
-        # Keepalive
+        # Keepalive cadence
         self._keepalive_secs = 45  # send time.tick every ~45s
 
     # --------------- Utilities ---------------
@@ -107,29 +126,42 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
+        """
+        Perform login:
+          - P = SHA1(password).hexdigest()[:32]
+          - UEI = email as provided (trimmed; do NOT lowercase)
+        """
         payload = {
             "ULC": {
                 "OI": 1550005,
                 "NT": "SetLogin",
-                "UEI": email.lower().strip(),
+                "UEI": email.strip(),          # do not .lower()
                 "P": _encode_password(password),
             }
         }
+        _LOGGER.debug("SecureControls: sending LoginRequest for UEI=%s", payload["ULC"]["UEI"])
+
         try:
             resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
         except aiohttp.ClientError as e:
+            _LOGGER.error("SecureControls: HTTP exception during login: %s", e)
             raise CannotConnect(f"HTTP error connecting: {e}") from e
 
-        # Map status first (many backends return 200 + error body though)
+        # Fast-path status mapping (many backends still return 200+error body)
         if resp.status in (401, 403):
+            _LOGGER.warning("SecureControls: login HTTP status %s (unauthorized/forbidden)", resp.status)
             raise InvalidAuth("HTTP unauthorized/forbidden")
         if resp.status >= 500:
+            _LOGGER.error("SecureControls: server error %s on login", resp.status)
             raise CannotConnect(f"Server error: {resp.status}")
 
+        # Parse JSON (or surface raw body on failure)
         try:
             root = await resp.json()
-        except Exception as e:
-            raise CannotConnect(f"Bad JSON from login: {e}") from e
+        except Exception:
+            txt = await resp.text()
+            _LOGGER.error("SecureControls: bad JSON from login (HTTP %s): %s", resp.status, txt[:400])
+            raise CannotConnect(f"Bad JSON from login (HTTP {resp.status})")
 
         d = root.get("D") or {}
         jwt = d.get("JT")
@@ -137,27 +169,45 @@ class SecureControlsClient:
         gd = d.get("GD") or []
 
         if not jwt or not si:
-            # Some backends return RI/error fields. If present, expose them for logs.
-            ri = root.get("RI")
-            raise InvalidAuth(f"Missing JT/SI in response (RI={ri})")
+            # Log full response (trimmed) to help diagnose (RI often -1 on failure)
+            _LOGGER.warning(
+                "SecureControls: login missing JT/SI. RI=%s, payload=%s",
+                root.get("RI"),
+                json.dumps(root)[:800],
+            )
+            raise InvalidAuth(f"Missing JT/SI in response (RI={root.get('RI')})")
 
+        # Save session/auth
         self._jwt = jwt
         self._session_id = si
         self._session_ts = d.get("JTT")
         self._user_id = d.get("UI")
 
+        _LOGGER.debug(
+            "SecureControls: login ok. SI=%s UI=%s JTT=%s, GD count=%s",
+            self._session_id, self._user_id, self._session_ts, len(gd),
+        )
+
         if not gd:
-            # Not strictly auth failure, but fail the flow with a clear reason later.
+            # Not strictly auth failure, but tell the caller why we can’t continue.
+            _LOGGER.error("SecureControls: login ok but no devices (GD empty)")
             raise ApiError("Login ok but no devices (GD empty)")
 
-        # select first thermostat (= gateway)
+        # Select first thermostat (= gateway)
         gw = gd[0]
         self.thermostat = Thermostat(
             gmi=str(gw["GMI"]),
             sn=str(gw["SN"]),
             hn=str(gw["HN"]),
-            cs=gw.get("CS"), ur=gw.get("UR"),
-            hi=gw.get("HI"), dt=gw.get("DT"), dn=gw.get("DN"),
+            cs=gw.get("CS"),
+            ur=gw.get("UR"),
+            hi=gw.get("HI"),
+            dt=gw.get("DT"),
+            dn=gw.get("DN"),
+        )
+        _LOGGER.debug(
+            "SecureControls: selected thermostat GMI=%s SN=%s HN=%s",
+            self.thermostat.gmi, self.thermostat.sn, self.thermostat.hn,
         )
 
     # --------------- WebSocket lifecycle ---------------
@@ -174,6 +224,7 @@ class SecureControlsClient:
             raise RuntimeError("Call login() first")
 
         self._stop.clear()
+        _LOGGER.debug("SecureControls: opening WebSocket to %s", WS_URL)
         self._ws = await self._http.ws_connect(
             WS_URL,
             headers=self._ws_headers(),
@@ -181,12 +232,15 @@ class SecureControlsClient:
             heartbeat=None,  # we handle keepalive via time.tick op
             autoping=True,
         )
+        _LOGGER.debug("SecureControls: WebSocket connected (protocol=%s)", WS_SUBPROTOCOL)
+
         # Start receiver & keepalive
         self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
         self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
 
     async def disconnect(self) -> None:
         self._stop.set()
+        _LOGGER.debug("SecureControls: disconnect requested")
 
         if self._ping_task:
             self._ping_task.cancel()
@@ -218,9 +272,10 @@ class SecureControlsClient:
             try:
                 payload = json.loads(msg.data)
             except json.JSONDecodeError:
+                _LOGGER.debug("SecureControls: non-JSON WS frame: %s", msg.data[:120])
                 continue
 
-            # Reply to a request
+            # Replies (to our requests)
             corr = payload.get("I")
             if corr and ("R" in payload or "E" in payload):
                 fut = self._pending.pop(corr, None)
@@ -228,21 +283,24 @@ class SecureControlsClient:
                     if "R" in payload:
                         fut.set_result(payload["R"])
                     else:
+                        _LOGGER.warning("SecureControls: WS error reply: %s", payload.get("E"))
                         fut.set_exception(RuntimeError(payload.get("E")))
                 continue
 
-            # Push notify
+            # Push notifies
             if payload.get("M") == "Notify":
                 await self._dispatch_notify(payload)
                 continue
+
+            _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
 
     async def _keepalive_loop(self) -> None:
         # Send time.tick (HI/SI = 2/103) periodically
         while not self._stop.is_set():
             try:
                 await self.time_tick()  # fire-and-forget is fine
-            except Exception:
-                pass
+            except Exception as e:
+                _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
             await asyncio.wait_for(asyncio.sleep(self._keepalive_secs), timeout=None)
 
     # --------------- Envelope + send ---------------
@@ -268,14 +326,15 @@ class SecureControlsClient:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[corr] = fut
         await self._ws.send_json(env)
+        _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
         return await fut
 
     async def _send_fire_and_forget(self, *, hi: int, si: int, args: Optional[list[Any]] = None) -> None:
-        # For commands where you don't care about the reply
         if not self._ws or self._ws.closed:
             raise RuntimeError("WebSocket not connected")
         if not self.thermostat:
             raise RuntimeError("No thermostat selected")
+
         env: Json = {
             "V": "1.0",
             "DTS": self._now_epoch(),
