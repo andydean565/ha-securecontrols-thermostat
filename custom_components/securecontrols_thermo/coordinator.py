@@ -14,7 +14,7 @@ _LOGGER = logging.getLogger(__name__)
 # Item map (SI:15, slot 1)
 ITEM_TARGET = 1
 ITEM_POWER = 6
-ITEM_PROBE = 7
+ITEM_PROBE = 2
 ITEM_HUMID = 8
 ITEM_NEXT_TIME = 9
 ITEM_NEXT_VALUE = 10
