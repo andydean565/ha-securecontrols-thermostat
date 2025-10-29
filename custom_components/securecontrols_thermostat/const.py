@@ -1,4 +1,4 @@
-DOMAIN = "securecontrols_thermo"
+DOMAIN = "securecontrols_thermostat"
 PLATFORMS: list[str] = ["climate"]
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"

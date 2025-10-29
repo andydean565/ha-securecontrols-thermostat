@@ -1,8 +1,8 @@
 # 🏠 Secure Controls Thermostat (Home Assistant Integration)
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-blue.svg)](https://hacs.xyz/)
-[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermo)
-![License](https://img.shields.io/github/license/yourusername/ha-securecontrols_thermo)
+[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermostat)
+![License](https://img.shields.io/github/license/yourusername/ha-securecontrols_thermostat)
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 
 A custom [Home Assistant](https://www.home-assistant.io) integration for **Secure Controls smart thermostats**, connecting via the official **Beanbag Cloud API** and **WebSocket** interface.
@@ -31,16 +31,16 @@ This integration enables real-time two-way communication with Secure thermostats
 1. In Home Assistant, open **HACS → Integrations → Custom Repositories**
 2. Add this repository’s URL:
    ```
-   https://github.com/yourusername/ha-securecontrols_thermo
+   https://github.com/yourusername/ha-securecontrols_thermostat
    ```
 3. Select category **Integration**
 4. Install **Secure Controls Thermostat**
 5. Restart Home Assistant
 
 ### Option 2 — Manual
-1. Copy the folder `custom_components/securecontrols_thermo` into your HA config directory:
+1. Copy the folder `custom_components/securecontrols_thermostat` into your HA config directory:
    ```
-   config/custom_components/securecontrols_thermo/
+   config/custom_components/securecontrols_thermostat/
    ```
 2. Restart Home Assistant
 
@@ -56,7 +56,7 @@ This integration enables real-time two-way communication with Secure thermostats
    - Discover your gateways and thermostats  
    - Open a WebSocket for real-time updates  
 
-[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermo)
+[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermostat)
 
 ---
 
@@ -65,7 +65,7 @@ This integration enables real-time two-way communication with Secure thermostats
 This integration includes your company logo (`icon.png`) for branding.
 
 ```
-custom_components/securecontrols_thermo/
+custom_components/securecontrols_thermostat/
 ├── __init__.py
 ├── api.py
 ├── climate.py
@@ -80,12 +80,12 @@ custom_components/securecontrols_thermo/
 
 You can also expose it as an entity picture by placing a copy under:
 ```
-config/www/securecontrols_thermo/icon.png
+config/www/securecontrols_thermostat/icon.png
 ```
 
 Then, in your entity code:
 ```python
-self._attr_entity_picture = "/local/securecontrols_thermo/icon.png"
+self._attr_entity_picture = "/local/securecontrols_thermostat/icon.png"
 ```
 
 ---
@@ -130,7 +130,7 @@ Example telemetry payload:
 ## 📁 Folder Structure
 
 ```
-custom_components/securecontrols_thermo/
+custom_components/securecontrols_thermostat/
 ├── __init__.py           # integration setup
 ├── api.py                # HTTP + WebSocket client
 ├── climate.py            # Thermostat entity
@@ -160,4 +160,4 @@ MIT License © 2025 [Your Name or Company]
 
 Click below to add the integration directly in your Home Assistant instance:
 
-[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermo)
+[![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermostat)

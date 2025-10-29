@@ -13,7 +13,7 @@
   "icon": "assets/icon.png",
   "logo": "assets/icon.png",
   "loggers": [
-    "securecontrols_thermo"
+    "securecontrols_thermostat"
   ],
   "requirements": []
 }
