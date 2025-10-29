@@ -86,8 +86,8 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
-        hashed = hashlib.md5(password.encode("utf-8")).hexdigest()
-        payload = {"ULC": {"OI": 1550005, "NT": "SetLogin", "UEI": email, "P": hashed}}
+        sha1_hash = hashlib.sha1(password.encode("utf-8")).hexdigest()[:32]
+        payload = {"ULC": {"OI": 1550005, "NT": "SetLogin", "UEI": email, "P": sha1_hash}}
         resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
         resp.raise_for_status()
         root = await resp.json()
