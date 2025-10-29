@@ -1,5 +1,5 @@
 {
-  "domain": "securecontrols_thermo",
+  "domain": "securecontrols_thermostat",
   "name": "Secure Controls Thermostat",
   "codeowners": [
     "@andydean565"
