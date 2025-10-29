@@ -144,10 +144,16 @@ class SecureControlsClient:
             }
         }
         
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Request-id": "1",
+        }
+        
         _LOGGER.warning("SecureControls: LoginRequest UEI=%r", payload["ULC"]["UEI"])
 
         try:
-            resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
+            resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload, headers=headers)
         except aiohttp.ClientError as e:
             _LOGGER.error("SecureControls: HTTP exception during login: %s", e)
             raise CannotConnect(f"HTTP error connecting: {e}") from e
