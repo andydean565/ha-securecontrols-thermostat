@@ -58,11 +58,15 @@ class CannotConnect(ApiError):
 # --------------------------------------------------------------------------------------
 def _encode_password(pw: str) -> str:
     """
-    Secure Controls / Beanbag expects: SHA1(password).hexdigest() truncated to 32 chars.
+    SecureControls / Beanbag login expects MD5(password).hexdigest()
+    (32 lowercase hex characters). Do NOT truncate.
     """
-    digest = hashlib.sha1(pw.encode("utf-8")).hexdigest()[:32]
-    # DEBUG: Log the digest (still sensitive; enable only in development)
-    _LOGGER.debug("SecureControls: computed password digest (SHA1[:32]) = %s", digest)
+    digest = hashlib.md5(pw.encode("utf-8")).hexdigest()
+    # quick sanity check (matches what you tested)
+    if len(digest) != 32 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("Password digest must be a 32-character lowercase hex string")
+    # Log cautiously: show only prefix/suffix
+    _LOGGER.warning("Login digest (md5): %s…%s", digest[:6], digest[-6:])
     return digest
 
 
@@ -139,7 +143,8 @@ class SecureControlsClient:
                 "P": _encode_password(password),
             }
         }
-        _LOGGER.debug("SecureControls: sending LoginRequest for UEI=%s", payload["ULC"]["UEI"])
+        
+        _LOGGER.warning("SecureControls: LoginRequest UEI=%r", payload["ULC"]["UEI"])
 
         try:
             resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload)
