@@ -40,7 +40,15 @@ class CannotConnect(ApiError):
 
 def _encode_password(pw: str) -> str:
     # Beanbag expects SHA1(password) hex, truncated to 32 chars
-    return hashlib.md5(pw.encode("utf-8")).hexdigest()[:32]
+    encoded =  hashlib.md5(pw.encode("utf-8")).hexdigest()
+    if len(encoded) != 32 or not all(
+            ch in "0123456789abcdefABCDEF" for ch in encoded
+        ):
+         raise ValueError(
+                "Password digest must be a 32-character hexadecimal string"
+            )
+    return encoded
+
 
 class SecureControlsClient:
     """
@@ -103,7 +111,7 @@ class SecureControlsClient:
             "ULC": {
                 "OI": 1550005,
                 "NT": "SetLogin",
-                "UEI": email.lower(),
+                "UEI": email.lower().strip(),
                 "P": _encode_password(password),
             }
         }
