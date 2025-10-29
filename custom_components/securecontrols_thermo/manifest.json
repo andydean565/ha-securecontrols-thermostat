@@ -10,6 +10,7 @@
   "integration_type": "hub",
   "version": "0.1.0",
   "config_flow": true,
+  "logo": "assets/icon.png",
   "loggers": [
     "securecontrols_thermo"
   ],
