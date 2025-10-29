@@ -103,7 +103,7 @@ class SecureControlsClient:
             "ULC": {
                 "OI": 1550005,
                 "NT": "SetLogin",
-                "UEI": email,
+                "UEI": email.lower(),
                 "P": _encode_password(password),
             }
         }
