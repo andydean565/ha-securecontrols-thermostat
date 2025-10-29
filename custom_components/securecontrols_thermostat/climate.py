@@ -6,7 +6,8 @@ from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
     HVACMode,
     ClimateEntityFeature,
-    PRESET_NONE,
+    PRESET_HOME,
+    PRESET_AWAY
 )
 from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
 from homeassistant.helpers.entity import DeviceInfo
@@ -28,8 +29,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity):
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]
-    _attr_preset_modes = [PRESET_NONE]
+    _attr_hvac_modes = []
+    _attr_preset_modes = [PRESET_HOME, PRESET_AWAY]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
@@ -67,11 +68,11 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
 
     # ------------- State -------------
 
-    @property
-    def hvac_mode(self) -> HVACMode:
-        s = self.coordinator.data or {}
-        # coordinator maps "power" 0=Off, 2=On
-        return HVACMode.OFF if s.get("power") in (0, None) else HVACMode.HEAT
+    # @property
+    # def hvac_mode(self) -> HVACMode:
+    #     s = self.coordinator.data or {}
+    #     # coordinator maps "power" 0=Off, 2=On
+    #     return HVACMode.OFF if s.get("power") in (0, None) else HVACMode.HEAT
 
     @property
     def current_temperature(self) -> Optional[float]:
@@ -90,8 +91,8 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
     
     @property
     def preset_mode(self) -> str:
-        # Not implementing presets yet; expose "none" to keep UX simple
-        return PRESET_NONE
+        s = self.coordinator.data or {}
+        return PRESET_AWAY if s.get("power") in (1, None) else PRESET_HOME
 
     # ------------- Commands -------------
 
