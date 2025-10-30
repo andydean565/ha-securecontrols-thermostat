@@ -317,7 +317,7 @@ class SecureControlsClient:
                         stale_after,
                     )
                     # Optionally implement auto-reconnect here if desired
-                    # await self._reconnect()
+                    await self._reconnect()
             except Exception:
                 pass
 
