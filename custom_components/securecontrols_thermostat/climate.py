@@ -72,8 +72,13 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
 
     @property
     def hvac_mode(self) -> HVACMode:
-        # Device only supports heat; actual firing state is exposed via hvac_action.
-        return HVACMode.HEAT
+        s = self.coordinator.data or {}
+        hvac_val = s.get("hvac")
+        if hvac_val == 1:
+            return HVACMode.HEAT
+        else:
+            return HVACMode.OFF
+
 
     @property
     def hvac_action(self) -> HVACAction | None:
