@@ -32,8 +32,8 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
 
     # writable: target temp + preset; hvac mode is NOT writable
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
-    _attr_hvac_modes = [HVACMode.HEAT]  # single fixed mode
-    _attr_preset_modes = [PRESET_NONE, "away", "home"]
+    _attr_hvac_modes = [HVACMode.HEAT, HVACAction.IDLE]  # single fixed mode
+    _attr_preset_modes = ["away", "home"]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
@@ -108,6 +108,12 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
         return s.get("preset") or PRESET_NONE
 
     # ---------- Commands (no set_hvac_mode) ----------
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target hvac mode."""
+        if hvac_mode != HVACMode.HEAT:
+            await self.client.set_target_temp(self.current_temperature + 2.0)
+        else:
+            await self.client.set_target_temp(self.target_temperature - 2.0)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         if ATTR_TEMPERATURE in kwargs:
