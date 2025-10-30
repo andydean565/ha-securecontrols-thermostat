@@ -115,10 +115,10 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
     # ---------- Commands (no set_hvac_mode) ----------
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        if hvac_mode != HVACMode.HEAT:
+        if hvac_mode == HVACMode.HEAT:
             await self.client.set_target_temp(self.current_temperature + 2.0)
         else:
-            await self.client.set_target_temp(self.target_temperature - 2.0)
+            await self.client.set_target_temp(self.current_temperature - 2.0)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         if ATTR_TEMPERATURE in kwargs:
