@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Awaitable, Callable, AsyncIterator, List, Union
+from typing import Any, Dict, Optional, Awaitable, Callable, AsyncIterator, List, Union, cast
 import aiohttp
 import asyncio
 import hashlib
@@ -110,6 +110,7 @@ class SecureControlsClient:
         self._recv_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        self._last_rx_ts: int = 0  # last time we received anything on WS (epoch seconds)
 
         # Correlation (I -> future)
         self._pending: Dict[str, asyncio.Future] = {}
@@ -237,6 +238,7 @@ class SecureControlsClient:
             heartbeat=None,  # we handle keepalive via time.tick op
             autoping=True,
         )
+        self._last_rx_ts = self._now_epoch()  # mark WS activity
         _LOGGER.debug("SecureControls: WebSocket connected (protocol=%s)", WS_SUBPROTOCOL)
 
         self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
@@ -270,12 +272,15 @@ class SecureControlsClient:
     async def _recv_loop(self) -> None:
         assert self._ws is not None
         async for msg in self._ws:
+            # update last RX timestamp on any frame
+            self._last_rx_ts = self._now_epoch()
+
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
             try:
-                payload = json.loads(msg.data)
+                payload = json.loads(cast(str, msg.data))
             except json.JSONDecodeError:
-                _LOGGER.debug("SecureControls: non-JSON WS frame: %s", msg.data[:120])
+                _LOGGER.debug("SecureControls: non-JSON WS frame: %s", str(msg.data)[:120])
                 continue
 
             corr = payload.get("I")
@@ -296,12 +301,27 @@ class SecureControlsClient:
             _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
 
     async def _keepalive_loop(self) -> None:
+        stale_after = 180  # seconds without RX before we warn (tunable)
         while not self._stop.is_set():
             try:
-                await self.time_tick()
+                # Fire-and-forget tick so we don't hang the loop if replies are dropped
+                await self.time_tick_ff()
             except Exception as e:
                 _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
-            await asyncio.wait_for(asyncio.sleep(self._keepalive_secs), timeout=None)
+
+            # Optional: stale socket detection
+            try:
+                if self._last_rx_ts and (self._now_epoch() - self._last_rx_ts > stale_after):
+                    _LOGGER.warning(
+                        "SecureControls: WS appears stale (no RX >%ss); server may have dropped us",
+                        stale_after,
+                    )
+                    # Optionally implement auto-reconnect here if desired
+                    # await self._reconnect()
+            except Exception:
+                pass
+
+            await asyncio.sleep(self._keepalive_secs)
 
     # --------------- Envelope + send ---------------
     async def _send_request(self, *, hi: int, si: int, args: Optional[List[Any]] = None) -> Any:
@@ -373,8 +393,12 @@ class SecureControlsClient:
         return await self._send_request(hi=49, si=11)
 
     async def time_tick(self) -> Any:
-        # 2/103 with [epochSeconds]
+        # 2/103 with [epochSeconds] — request/response variant
         return await self._send_request(hi=2, si=103, args=[self._now_epoch()])
+
+    async def time_tick_ff(self) -> None:
+        """Fire-and-forget keepalive tick (recommended)."""
+        await self._send_fire_and_forget(hi=2, si=103, args=[self._now_epoch()])
 
     async def device_metadata_read(self) -> Any:
         # 17/11
