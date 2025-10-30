@@ -32,7 +32,7 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
 
     # writable: target temp + preset; hvac mode is NOT writable
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
-    _attr_hvac_modes = [HVACMode.HEAT, HVACAction.IDLE]  # single fixed mode
+    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]  # single fixed mode
     _attr_preset_modes = ["away", "home"]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
