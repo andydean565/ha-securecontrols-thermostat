@@ -122,6 +122,9 @@ class SecureControlsClient:
         # Keepalive cadence
         self._keepalive_secs = 45  # send time.tick every ~45s
 
+        # Reconnect guard
+        self._reconnect_lock = asyncio.Lock()
+
     # --------------- Utilities ---------------
     @staticmethod
     def _now_epoch() -> int:
@@ -269,39 +272,141 @@ class SecureControlsClient:
                 fut.set_exception(asyncio.CancelledError())
         self._pending.clear()
 
+    async def _reconnect(self, reason: Optional[str] = None) -> None:
+        """
+        Tear down the current WS and re-establish it with exponential backoff.
+        Does NOT attempt to re-login (we don't have credentials here). If the token
+        has expired and the server returns 401/403, raise InvalidAuth so the caller
+        can perform a fresh login.
+        """
+        if self._stop.is_set():
+            _LOGGER.debug("SecureControls: reconnect skipped; client is stopping")
+            return
+
+        async with self._reconnect_lock:
+            # If another task already reconnected us, bail.
+            if self._ws and not self._ws.closed and self._recv_task and not self._recv_task.done():
+                _LOGGER.debug("SecureControls: reconnect not needed (WS alive)")
+                return
+
+            if reason:
+                _LOGGER.warning("SecureControls: reconnecting WS (%s)", reason)
+            else:
+                _LOGGER.warning("SecureControls: reconnecting WS")
+
+            # Best-effort cleanup of old tasks/socket
+            if self._ping_task:
+                self._ping_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._ping_task
+                self._ping_task = None
+
+            if self._recv_task:
+                self._recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._recv_task
+                self._recv_task = None
+
+            if self._ws and not self._ws.closed:
+                with contextlib.suppress(Exception):
+                    await self._ws.close()
+            self._ws = None
+
+            # Fail any in-flight requests so callers aren't left hanging
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("WebSocket reconnecting; request cancelled"))
+            self._pending.clear()
+
+            # Retry loop with backoff
+            attempt = 0
+            while not self._stop.is_set():
+                attempt += 1
+                # Immediate first attempt; then 1,2,4,8,... up to 30s + small jitter
+                if attempt > 1:
+                    base = min(30, 2 ** (attempt - 2))  # 1,2,4,8,16,30,30...
+                    jitter = (secrets.randbelow(1000) / 1000.0)  # 0..1 second
+                    delay = base + jitter
+                    _LOGGER.debug("SecureControls: reconnect backoff %.2fs (attempt %s)", delay, attempt)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                        _LOGGER.debug("SecureControls: reconnect aborted due to stop")
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+
+                try:
+                    if not self._jwt or not self._session_id:
+                        raise InvalidAuth("Missing JWT/session for reconnect")
+
+                    _LOGGER.debug("SecureControls: opening WebSocket (reconnect attempt %s)", attempt)
+                    self._ws = await self._http.ws_connect(
+                        WS_URL,
+                        headers=self._ws_headers(),
+                        protocols=[WS_SUBPROTOCOL],
+                        heartbeat=None,
+                        autoping=True,
+                    )
+                    self._last_rx_ts = self._now_epoch()
+                    _LOGGER.info("SecureControls: WebSocket reconnected on attempt %s", attempt)
+
+                    # Restart background tasks
+                    self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
+                    self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
+                    return
+
+                except aiohttp.WSServerHandshakeError as e:
+                    if e.status in (401, 403):
+                        _LOGGER.error("SecureControls: WS handshake unauthorized (%s); need re-login", e.status)
+                        raise InvalidAuth(f"WS unauthorized ({e.status})") from e
+                    _LOGGER.warning("SecureControls: WS handshake error %s; will retry", e.status)
+                except aiohttp.ClientError as e:
+                    _LOGGER.warning("SecureControls: WS connect error: %s; will retry", e)
+                except Exception as e:
+                    _LOGGER.exception("SecureControls: unexpected error during reconnect: %s", e)
+
+            _LOGGER.debug("SecureControls: reconnect loop exited (stop set)")
+
     async def _recv_loop(self) -> None:
         assert self._ws is not None
-        async for msg in self._ws:
-            # update last RX timestamp on any frame
-            self._last_rx_ts = self._now_epoch()
+        try:
+            async for msg in self._ws:
+                # update last RX timestamp on any frame
+                self._last_rx_ts = self._now_epoch()
 
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            try:
-                payload = json.loads(cast(str, msg.data))
-            except json.JSONDecodeError:
-                _LOGGER.debug("SecureControls: non-JSON WS frame: %s", str(msg.data)[:120])
-                continue
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    payload = json.loads(cast(str, msg.data))
+                except json.JSONDecodeError:
+                    _LOGGER.debug("SecureControls: non-JSON WS frame: %s", str(msg.data)[:120])
+                    continue
 
-            corr = payload.get("I")
-            if corr and ("R" in payload or "E" in payload):
-                fut = self._pending.pop(corr, None)
-                if fut and not fut.done():
-                    if "R" in payload:
-                        fut.set_result(payload["R"])
-                    else:
-                        _LOGGER.warning("SecureControls: WS error reply: %s", payload.get("E"))
-                        fut.set_exception(RuntimeError(payload.get("E")))
-                continue
+                corr = payload.get("I")
+                if corr and ("R" in payload or "E" in payload):
+                    fut = self._pending.pop(corr, None)
+                    if fut and not fut.done():
+                        if "R" in payload:
+                            fut.set_result(payload["R"])
+                        else:
+                            _LOGGER.warning("SecureControls: WS error reply: %s", payload.get("E"))
+                            fut.set_exception(RuntimeError(payload.get("E")))
+                    continue
 
-            if payload.get("M") == "Notify":
-                await self._dispatch_notify(payload)
-                continue
+                if payload.get("M") == "Notify":
+                    await self._dispatch_notify(payload)
+                    continue
 
-            _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
+                _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
+        except Exception as e:
+            _LOGGER.warning("SecureControls: recv loop terminated: %s", e)
+            # Try to reconnect unless stopping
+            if not self._stop.is_set():
+                with contextlib.suppress(Exception):
+                    await self._reconnect("recv loop error")
 
     async def _keepalive_loop(self) -> None:
-        stale_after = 180  # seconds without RX before we warn (tunable)
+        stale_after = 180  # seconds without RX before we reconnect (tunable)
         while not self._stop.is_set():
             try:
                 # Fire-and-forget tick so we don't hang the loop if replies are dropped
@@ -309,17 +414,16 @@ class SecureControlsClient:
             except Exception as e:
                 _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
 
-            # Optional: stale socket detection
+            # Stale socket detection -> reconnect
             try:
                 if self._last_rx_ts and (self._now_epoch() - self._last_rx_ts > stale_after):
                     _LOGGER.warning(
-                        "SecureControls: WS appears stale (no RX >%ss); server may have dropped us",
+                        "SecureControls: WS appears stale (no RX >%ss); attempting reconnect",
                         stale_after,
                     )
-                    # Optionally implement auto-reconnect here if desired
-                    await self._reconnect()
-            except Exception:
-                pass
+                    await self._reconnect("stale socket")
+            except Exception as e:
+                _LOGGER.debug("SecureControls: keepalive stale-check error: %s", e)
 
             await asyncio.sleep(self._keepalive_secs)
 
