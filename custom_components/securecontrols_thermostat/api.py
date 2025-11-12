@@ -61,11 +61,21 @@ class ApiError(Exception):
 
 
 class InvalidAuth(ApiError):
+    """Auth/session rejected: refresh credentials and reconnect."""
     pass
 
 
 class CannotConnect(ApiError):
     pass
+
+
+class ServerRejected(ApiError):
+    """Application-level error returned by the SecureControls API."""
+    def __init__(self, code: Optional[int], subcode: Optional[int], details: Any) -> None:
+        super().__init__(f"Server rejected request (C={code} EC={subcode}) details={details}")
+        self.code = code
+        self.subcode = subcode
+        self.details = details
 
 
 # --------------------------------------------------------------------------------------
@@ -80,6 +90,33 @@ def _encode_password(pw: str) -> str:
     if len(digest) != 32 or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("Password digest must be a 32-character lowercase hex string")
     return digest
+
+
+def _decode_api_error(err_obj: Dict[str, Any]) -> tuple[Optional[int], Optional[int], Dict[str, Any], str]:
+    """
+    Extract (C, EC, EA, message) from either a WS 'E' object or a REST envelope.
+    Accepts shapes like:
+      {'C': 203, 'M': '...', 'D': {'ES':203, 'EC':2, 'ET':203, 'EA':{...}}}
+      or the WS 'E' object directly: {'C':203,'EC':2,'EA':{...},'M':'...'}
+    """
+    if not isinstance(err_obj, dict):
+        return None, None, {}, f"{err_obj!r}"
+
+    # Top-level fields
+    c = err_obj.get("C")
+    ec = err_obj.get("EC")
+    ea = err_obj.get("EA") or {}
+    msg = err_obj.get("M") or ""
+
+    # Nested detail (common on REST envelope)
+    d = err_obj.get("D")
+    if isinstance(d, dict):
+        c = c or d.get("ES") or d.get("ET")
+        ec = ec or d.get("EC")
+        ea = ea or d.get("EA") or {}
+        msg = msg or d.get("M") or ""
+
+    return c, ec, ea, msg or ""
 
 
 # --------------------------------------------------------------------------------------
@@ -101,6 +138,10 @@ class SecureControlsClient:
         self._session_id: Optional[int] = None    # D.SI
         self._session_ts: Optional[int] = None    # D.JTT
         self._user_id: Optional[int] = None       # D.UI
+
+        # Cached creds for auto re-login (optional)
+        self._email: Optional[str] = None
+        self._password: Optional[str] = None  # raw; used to recompute MD5 on demand
 
         # Device (gateway == thermostat)
         self.thermostat: Optional[Thermostat] = None
@@ -144,6 +185,10 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
+        # Cache for auto re-login
+        self._email = email
+        self._password = password
+
         payload = {
             "ULC": {
                 "OI": 1550005,
@@ -176,6 +221,14 @@ class SecureControlsClient:
             txt = await resp.text()
             _LOGGER.error("SecureControls: bad JSON from login (HTTP %s): %s", resp.status, txt[:400])
             raise CannotConnect(f"Bad JSON from login (HTTP {resp.status})")
+
+        # Some responses use an error envelope even with HTTP 200
+        if isinstance(root, dict) and "C" in root and root.get("C") != 200:
+            c, ec, ea, msg = _decode_api_error(root)
+            _LOGGER.error("SecureControls: login rejected (C=%s EC=%s) %s EA=%s", c, ec, msg, ea)
+            if c == 203 and ec == 2:
+                raise InvalidAuth("Login rejected: credentials/session invalid (C=203 EC=2)")
+            raise ServerRejected(c, ec, ea)
 
         d = root.get("D") or {}
         jwt = d.get("JT")
@@ -272,12 +325,94 @@ class SecureControlsClient:
                 fut.set_exception(asyncio.CancelledError())
         self._pending.clear()
 
+    async def _relogin_and_reconnect(self, reason: str) -> None:
+        """
+        Re-login with cached credentials (if present) and reconnect WS.
+        Falls back to plain reconnect if creds are missing.
+        """
+        if self._stop.is_set():
+            _LOGGER.debug("SecureControls: relogin skipped; client is stopping")
+            return
+
+        if not (self._email and self._password):
+            _LOGGER.debug("SecureControls: no cached creds; falling back to reconnect (%s)", reason)
+            await self._reconnect(reason)
+            return
+
+        async with self._reconnect_lock:
+            _LOGGER.warning("SecureControls: attempting re-login (%s)", reason)
+
+            # Cleanup old tasks/socket similar to _reconnect
+            if self._ping_task:
+                self._ping_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._ping_task
+                self._ping_task = None
+
+            if self._recv_task:
+                self._recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._recv_task
+                self._recv_task = None
+
+            if self._ws and not self._ws.closed:
+                with contextlib.suppress(Exception):
+                    await self._ws.close()
+            self._ws = None
+
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("Re-login in progress; request cancelled"))
+            self._pending.clear()
+
+            attempt = 0
+            while not self._stop.is_set():
+                attempt += 1
+                if attempt > 1:
+                    base = min(30, 2 ** (attempt - 2))  # 1,2,4,8,16,30,30...
+                    jitter = (secrets.randbelow(1000) / 1000.0)
+                    delay = base + jitter
+                    _LOGGER.debug("SecureControls: re-login backoff %.2fs (attempt %s)", delay, attempt)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                        _LOGGER.debug("SecureControls: re-login aborted due to stop")
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+
+                try:
+                    await self.login(self._email, self._password)
+                    _LOGGER.info("SecureControls: login refreshed; reconnecting WS")
+
+                    self._ws = await self._http.ws_connect(
+                        WS_URL,
+                        headers=self._ws_headers(),
+                        protocols=[WS_SUBPROTOCOL],
+                        heartbeat=None,
+                        autoping=True,
+                    )
+                    self._last_rx_ts = self._now_epoch()
+                    _LOGGER.info("SecureControls: WebSocket reconnected after re-login (attempt %s)", attempt)
+
+                    self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
+                    self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
+                    return
+
+                except InvalidAuth as e:
+                    _LOGGER.error("SecureControls: re-login rejected: %s", e)
+                    raise  # Bubble up so caller can handle bad credentials
+                except aiohttp.ClientError as e:
+                    _LOGGER.warning("SecureControls: WS connect error after re-login: %s; will retry", e)
+                except Exception as e:
+                    _LOGGER.exception("SecureControls: unexpected error during re-login reconnect: %s", e)
+
+            _LOGGER.debug("SecureControls: re-login loop exited (stop set)")
+
     async def _reconnect(self, reason: Optional[str] = None) -> None:
         """
         Tear down the current WS and re-establish it with exponential backoff.
-        Does NOT attempt to re-login (we don't have credentials here). If the token
-        has expired and the server returns 401/403, raise InvalidAuth so the caller
-        can perform a fresh login.
+        Does NOT attempt to re-login unless handshake indicates auth error, in
+        which case we will call _relogin_and_reconnect() if creds are cached.
         """
         if self._stop.is_set():
             _LOGGER.debug("SecureControls: reconnect skipped; client is stopping")
@@ -337,6 +472,10 @@ class SecureControlsClient:
 
                 try:
                     if not self._jwt or not self._session_id:
+                        # No session state; try full re-login if we can
+                        if self._email and self._password:
+                            await self._relogin_and_reconnect("missing jwt/session")
+                            return
                         raise InvalidAuth("Missing JWT/session for reconnect")
 
                     _LOGGER.debug("SecureControls: opening WebSocket (reconnect attempt %s)", attempt)
@@ -357,8 +496,9 @@ class SecureControlsClient:
 
                 except aiohttp.WSServerHandshakeError as e:
                     if e.status in (401, 403):
-                        _LOGGER.error("SecureControls: WS handshake unauthorized (%s); need re-login", e.status)
-                        raise InvalidAuth(f"WS unauthorized ({e.status})") from e
+                        _LOGGER.error("SecureControls: WS handshake unauthorized (%s); will try re-login", e.status)
+                        await self._relogin_and_reconnect(f"ws unauthorized {e.status}")
+                        return
                     _LOGGER.warning("SecureControls: WS handshake error %s; will retry", e.status)
                 except aiohttp.ClientError as e:
                     _LOGGER.warning("SecureControls: WS connect error: %s; will retry", e)
@@ -389,8 +529,22 @@ class SecureControlsClient:
                         if "R" in payload:
                             fut.set_result(payload["R"])
                         else:
-                            _LOGGER.warning("SecureControls: WS error reply: %s", payload.get("E"))
-                            fut.set_exception(RuntimeError(payload.get("E")))
+                            err_obj = payload.get("E") or {}
+                            c, ec, ea, msgtxt = _decode_api_error(err_obj)
+                            _LOGGER.warning(
+                                "SecureControls: WS error reply (C=%s EC=%s) %s EA=%s",
+                                c, ec, msgtxt, ea
+                            )
+                            if c == 203 and ec == 2:
+                                # Session/JWT rejected -> raise InvalidAuth and try to recover
+                                fut.set_exception(InvalidAuth("Session/JWT rejected (C=203 EC=2)"))
+                                # Try to refresh creds if we have them; otherwise plain reconnect
+                                if self._email and self._password:
+                                    asyncio.create_task(self._relogin_and_reconnect("auth/session rejected"))
+                                else:
+                                    asyncio.create_task(self._reconnect("auth/session rejected"))
+                            else:
+                                fut.set_exception(ServerRejected(c, ec, ea))
                     continue
 
                 if payload.get("M") == "Notify":
@@ -403,7 +557,10 @@ class SecureControlsClient:
             # Try to reconnect unless stopping
             if not self._stop.is_set():
                 with contextlib.suppress(Exception):
-                    await self._reconnect("recv loop error")
+                    if self._email and self._password:
+                        await self._relogin_and_reconnect("recv loop error")
+                    else:
+                        await self._reconnect("recv loop error")
 
     async def _keepalive_loop(self) -> None:
         stale_after = 180  # seconds without RX before we reconnect (tunable)
@@ -414,14 +571,17 @@ class SecureControlsClient:
             except Exception as e:
                 _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
 
-            # Stale socket detection -> reconnect
+            # Stale socket detection -> reconnect or relogin+reconnect
             try:
                 if self._last_rx_ts and (self._now_epoch() - self._last_rx_ts > stale_after):
                     _LOGGER.warning(
                         "SecureControls: WS appears stale (no RX >%ss); attempting reconnect",
                         stale_after,
                     )
-                    await self._reconnect("stale socket")
+                    if self._email and self._password:
+                        await self._relogin_and_reconnect("stale socket")
+                    else:
+                        await self._reconnect("stale socket")
             except Exception as e:
                 _LOGGER.debug("SecureControls: keepalive stale-check error: %s", e)
 
