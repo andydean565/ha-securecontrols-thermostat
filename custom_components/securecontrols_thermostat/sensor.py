@@ -25,6 +25,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     gmi: str = entry.data.get(CONF_GATEWAY_GMI) or getattr(getattr(client, "thermostat", None), "gmi", "unknown")
 
     entities: list[SensorEntity] = [
+        CurrentTempSensor(coordinator, client, gmi),
+        TargetTempSensor(coordinator, client, gmi),
         NextChangeTimeSensor(coordinator, client, gmi),
         NextTargetTempSensor(coordinator, client, gmi),
     ]
@@ -90,6 +92,44 @@ class NextChangeTimeSensor(_BaseSecureSensor):
             "next_change_mins": s.get("next_change_mins"),
             "next_target_c": s.get("next_target_c"),
         }
+
+
+class CurrentTempSensor(_BaseSecureSensor):
+    """Current measured ambient temperature (degC)."""
+
+    _attr_name = "Current Temperature"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
+        super().__init__(coordinator, client, gmi)
+        self._attr_unique_id = f"{gmi}_current_temp_c"
+
+    @property
+    def native_value(self) -> Optional[float]:
+        s = self.coordinator.data or {}
+        val = s.get("ambient_c")
+        return None if val is None else float(val)
+
+
+class TargetTempSensor(_BaseSecureSensor):
+    """Current active target temperature (degC)."""
+
+    _attr_name = "Target Temperature"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
+        super().__init__(coordinator, client, gmi)
+        self._attr_unique_id = f"{gmi}_target_temp_c"
+
+    @property
+    def native_value(self) -> Optional[float]:
+        s = self.coordinator.data or {}
+        val = s.get("target_c")
+        return None if val is None else float(val)
 
 
 class NextTargetTempSensor(_BaseSecureSensor):
