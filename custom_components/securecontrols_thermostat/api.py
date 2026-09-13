@@ -137,7 +137,7 @@ class SecureControlsClient:
     """
     Secure Controls / Beanbag client
     - HTTP login to get JWT + SessionId + GD
-    - Short-lived WebSocket transactions with the BB-BO-01 subprotocol
+    - One persistent WebSocket, reused for transactions with the BB-BO-01 subprotocol
     """
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
@@ -153,8 +153,12 @@ class SecureControlsClient:
         # Device (gateway == thermostat)
         self.thermostat: Thermostat | None = None
 
-        # WebSockets are intentionally short-lived. The lock ensures a response
-        # can only belong to the request which owns the active socket.
+        # A single WebSocket is opened after login and reused for every poll
+        # and command until unload or failure. Beanbag does not reliably
+        # permit a second WebSocket on the same session, so a lost connection
+        # is only ever reopened with the existing session/JWT; if that is
+        # rejected, the auth latch below forces a manual reload (fresh login)
+        # rather than a silent reconnect loop.
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._operation_lock = asyncio.Lock()
         self._auth_rejected = False
@@ -276,7 +280,7 @@ class SecureControlsClient:
             self.thermostat.hn,
         )
 
-    # --------------- Short-lived WebSocket lifecycle ---------------
+    # --------------- Persistent WebSocket lifecycle ---------------
     def _ws_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._jwt}",
@@ -325,7 +329,7 @@ class SecureControlsClient:
                 await websocket.close()
 
     async def disconnect(self) -> None:
-        """Close an in-flight short-lived socket during integration unload."""
+        """Close the persistent socket during integration unload."""
         websocket = self._ws
         if websocket is not None:
             await self._close_websocket(websocket)
@@ -360,7 +364,11 @@ class SecureControlsClient:
             if args is not None:
                 env["P"].append(args)
 
-            websocket = await self._open_websocket()
+            websocket = self._ws
+            if websocket is None or websocket.closed:
+                websocket = await self._open_websocket()
+
+            success = False
             try:
                 await websocket.send_json(env)
                 _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
@@ -381,6 +389,7 @@ class SecureControlsClient:
                             if not isinstance(payload, dict) or payload.get("I") != corr:
                                 continue
                             if "R" in payload:
+                                success = True
                                 return payload["R"]
                             if "E" in payload:
                                 err_obj = payload.get("E") or {}
@@ -414,7 +423,11 @@ class SecureControlsClient:
             except aiohttp.ClientError as err:
                 raise CannotConnect(f"WebSocket request failed: {err}") from err
             finally:
-                await self._close_websocket(websocket)
+                # Keep a successful transaction's socket open for reuse; any
+                # other outcome (error reply, timeout, transport loss,
+                # cancellation) leaves the socket unusable, so close it.
+                if not success:
+                    await self._close_websocket(websocket)
 
     # --------------- Reads (HI/SI pairs) ---------------
     async def zones_read(self) -> Any:
