@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "config_flow": true,
   "integration_type": "hub",
-  "iot_class": "cloud_push",
+  "iot_class": "cloud_polling",
   "documentation": "https://github.com/andydean565/ha-securecontrols-thermostat",
   "issue_tracker": "https://github.com/andydean565/ha-securecontrols-thermostat/issues",
   "icon": "assets/icon.png",

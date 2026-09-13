@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from homeassistant.core import HomeAssistant
+from contextlib import suppress
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, PLATFORMS, CONF_EMAIL, CONF_PASSWORD, CONF_GATEWAY_GMI
-from .api import SecureControlsClient
+from .api import InvalidAuth, SecureControlsClient
+from .const import CONF_EMAIL, CONF_GATEWAY_GMI, CONF_PASSWORD, DOMAIN, PLATFORMS
 from .coordinator import ThermoCoordinator
 
 
@@ -22,11 +24,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Login first; raise proper error so HA can retry if cloud is down
     try:
         await client.login(email, password)
+    except InvalidAuth as err:
+        # Authentication failures must not enter Home Assistant's automatic
+        # setup retry loop, which could repeatedly compete for the account.
+        raise ConfigEntryAuthFailed(f"Login rejected: {err}") from err
     except Exception as err:
         # ConfigEntryNotReady triggers HA to retry setup later
         raise ConfigEntryNotReady(f"Login failed: {err}") from err
 
-    # Create a single shared coordinator (will open WS on first refresh)
+    # Create a single shared coordinator; each refresh uses one short-lived WS.
     coordinator = ThermoCoordinator(hass, client)
     await coordinator.async_config_entry_first_refresh()
 
@@ -48,10 +54,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, {})
         client: SecureControlsClient | None = data.get("client")
         # Close WebSocket if open
-        try:
+        with suppress(Exception):
             if client is not None:
                 await client.disconnect()
-        except Exception:
-            # Swallow; we're shutting down/unloading
-            pass
     return unload_ok

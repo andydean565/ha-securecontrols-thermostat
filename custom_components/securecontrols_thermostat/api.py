@@ -1,14 +1,16 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Awaitable, Callable, AsyncIterator, List, Union, cast
-import aiohttp
+
 import asyncio
+import contextlib
 import hashlib
 import json
-import time
-import secrets
-import contextlib
 import logging
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import aiohttp
 
 # --------------------------------------------------------------------------------------
 # Logging
@@ -18,26 +20,31 @@ _LOGGER = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------------
 # Types / constants
 # --------------------------------------------------------------------------------------
-Json = Dict[str, Any]
-UpdateHandler = Callable[[Json], Awaitable[None]]
+Json = dict[str, Any]
 
 WS_URL = "wss://app.beanbag.online/api/TransactionRestAPI/ConnectWebSocket"
 WS_SUBPROTOCOL = "BB-BO-01"
+WS_RESPONSE_TIMEOUT_SECS = 15
+PASSWORD_DIGEST_LENGTH = 32
+HTTP_OK = 200
+HTTP_SERVER_ERROR = 500
+AUTH_ERROR_CODE = 203
+AUTH_ERROR_SUBCODE = 2
 
 # Thermostat "block" constants (per your usage)
-THERMO_HI_WRITE = 2     # thermostat.state.write
-THERMO_SI = 15          # thermostat state block
-THERMO_SLOT = 1         # slot used in your integration
+THERMO_HI_WRITE = 2  # thermostat.state.write
+THERMO_SI = 15  # thermostat state block
+THERMO_SLOT = 1  # slot used in your integration
 
 # Item map (SI:15, slot 1) — updated
-ITEM_TARGET = 1           # target_c (deci °C)
-ITEM_AMBIENT = 2          # ambient_c (deci °C)
-ITEM_HVAC = 3             # hvac: 0=off, 1=heat
-ITEM_PRESET = 6           # preset: 1=away, 2=home
-ITEM_HUMID = 8            # %RH
-ITEM_NEXT_TIME = 9        # next schedule time (mins)
-ITEM_NEXT_TARGET = 10     # next scheduled target temp (deci °C)
-ITEM_FROST = 11           # frost_c (deci °C)
+ITEM_TARGET = 1  # target_c (deci °C)
+ITEM_AMBIENT = 2  # ambient_c (deci °C)
+ITEM_HVAC = 3  # hvac: 0=off, 1=heat
+ITEM_PRESET = 6  # preset: 1=away, 2=home
+ITEM_HUMID = 8  # %RH
+ITEM_NEXT_TIME = 9  # next schedule time (mins)
+ITEM_NEXT_TARGET = 10  # next scheduled target temp (deci °C)
+ITEM_FROST = 11  # frost_c (deci °C)
 
 
 # ---- Thermostat metadata (gateway == device) ----
@@ -46,11 +53,11 @@ class Thermostat:
     gmi: str
     sn: str
     hn: str
-    cs: Optional[int] = None
-    ur: Optional[int] = None
-    hi: Optional[int] = None
-    dt: Optional[int] = None
-    dn: Optional[str] = None
+    cs: int | None = None
+    ur: int | None = None
+    hi: int | None = None
+    dt: int | None = None
+    dn: str | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -61,7 +68,8 @@ class ApiError(Exception):
 
 
 class InvalidAuth(ApiError):
-    """Auth/session rejected: refresh credentials and reconnect."""
+    """Authentication rejected; explicit login is required to resume requests."""
+
     pass
 
 
@@ -71,7 +79,8 @@ class CannotConnect(ApiError):
 
 class ServerRejected(ApiError):
     """Application-level error returned by the SecureControls API."""
-    def __init__(self, code: Optional[int], subcode: Optional[int], details: Any) -> None:
+
+    def __init__(self, code: int | None, subcode: int | None, details: Any) -> None:
         super().__init__(f"Server rejected request (C={code} EC={subcode}) details={details}")
         self.code = code
         self.subcode = subcode
@@ -87,12 +96,14 @@ def _encode_password(pw: str) -> str:
     (32 lowercase hex characters). Do NOT truncate.
     """
     digest = hashlib.md5(pw.encode("utf-8")).hexdigest()
-    if len(digest) != 32 or any(ch not in "0123456789abcdef" for ch in digest):
+    if len(digest) != PASSWORD_DIGEST_LENGTH or any(ch not in "0123456789abcdef" for ch in digest):
         raise ValueError("Password digest must be a 32-character lowercase hex string")
     return digest
 
 
-def _decode_api_error(err_obj: Dict[str, Any]) -> tuple[Optional[int], Optional[int], Dict[str, Any], str]:
+def _decode_api_error(
+    err_obj: dict[str, Any],
+) -> tuple[int | None, int | None, dict[str, Any], str]:
     """
     Extract (C, EC, EA, message) from either a WS 'E' object or a REST envelope.
     Accepts shapes like:
@@ -126,7 +137,7 @@ class SecureControlsClient:
     """
     Secure Controls / Beanbag client
     - HTTP login to get JWT + SessionId + GD
-    - WebSocket control with BB-BO-01 subprotocol
+    - Short-lived WebSocket transactions with the BB-BO-01 subprotocol
     """
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
@@ -134,37 +145,19 @@ class SecureControlsClient:
         self._base = "https://app.beanbag.online"
 
         # Auth/session
-        self._jwt: Optional[str] = None           # D.JT
-        self._session_id: Optional[int] = None    # D.SI
-        self._session_ts: Optional[int] = None    # D.JTT
-        self._user_id: Optional[int] = None       # D.UI
-
-        # Cached creds for auto re-login (optional)
-        self._email: Optional[str] = None
-        self._password: Optional[str] = None  # raw; used to recompute MD5 on demand
+        self._jwt: str | None = None  # D.JT
+        self._session_id: int | None = None  # D.SI
+        self._session_ts: int | None = None  # D.JTT
+        self._user_id: int | None = None  # D.UI
 
         # Device (gateway == thermostat)
-        self.thermostat: Optional[Thermostat] = None
+        self.thermostat: Thermostat | None = None
 
-        # WS
-        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._recv_task: Optional[asyncio.Task] = None
-        self._ping_task: Optional[asyncio.Task] = None
-        self._stop = asyncio.Event()
-        self._last_rx_ts: int = 0  # last time we received anything on WS (epoch seconds)
-
-        # Correlation (I -> future)
-        self._pending: Dict[str, asyncio.Future] = {}
-
-        # Push/notify
-        self._updates_q: asyncio.Queue[Json] = asyncio.Queue(maxsize=200)
-        self._handlers: list[UpdateHandler] = []
-
-        # Keepalive cadence
-        self._keepalive_secs = 45  # send time.tick every ~45s
-
-        # Reconnect guard
-        self._reconnect_lock = asyncio.Lock()
+        # WebSockets are intentionally short-lived. The lock ensures a response
+        # can only belong to the request which owns the active socket.
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._operation_lock = asyncio.Lock()
+        self._auth_rejected = False
 
     # --------------- Utilities ---------------
     @staticmethod
@@ -173,7 +166,7 @@ class SecureControlsClient:
 
     @staticmethod
     def c_to_deci(c: float) -> int:
-        return int(round(c * 10))
+        return round(c * 10)
 
     @staticmethod
     def deci_to_c(v: int) -> float:
@@ -185,10 +178,6 @@ class SecureControlsClient:
 
     # --------------- HTTP: Login ---------------
     async def login(self, email: str, password: str) -> None:
-        # Cache for auto re-login
-        self._email = email
-        self._password = password
-
         payload = {
             "ULC": {
                 "OI": 1550005,
@@ -203,30 +192,38 @@ class SecureControlsClient:
             "Request-id": "1",
         }
         try:
-            resp = await self._http.post(f"{self._base}/api/UserRestAPI/LoginRequest", json=payload, headers=headers)
+            resp = await self._http.post(
+                f"{self._base}/api/UserRestAPI/LoginRequest", json=payload, headers=headers
+            )
         except aiohttp.ClientError as e:
             _LOGGER.error("SecureControls: HTTP exception during login: %s", e)
             raise CannotConnect(f"HTTP error connecting: {e}") from e
 
         if resp.status in (401, 403):
-            _LOGGER.warning("SecureControls: login HTTP status %s (unauthorized/forbidden)", resp.status)
+            self._auth_rejected = True
+            _LOGGER.warning(
+                "SecureControls: login HTTP status %s (unauthorized/forbidden)", resp.status
+            )
             raise InvalidAuth("HTTP unauthorized/forbidden")
-        if resp.status >= 500:
+        if resp.status >= HTTP_SERVER_ERROR:
             _LOGGER.error("SecureControls: server error %s on login", resp.status)
             raise CannotConnect(f"Server error: {resp.status}")
 
         try:
             root = await resp.json()
-        except Exception:
+        except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as err:
             txt = await resp.text()
-            _LOGGER.error("SecureControls: bad JSON from login (HTTP %s): %s", resp.status, txt[:400])
-            raise CannotConnect(f"Bad JSON from login (HTTP {resp.status})")
+            _LOGGER.error(
+                "SecureControls: bad JSON from login (HTTP %s): %s", resp.status, txt[:400]
+            )
+            raise CannotConnect(f"Bad JSON from login (HTTP {resp.status})") from err
 
         # Some responses use an error envelope even with HTTP 200
-        if isinstance(root, dict) and "C" in root and root.get("C") != 200:
+        if isinstance(root, dict) and "C" in root and root.get("C") != HTTP_OK:
             c, ec, ea, msg = _decode_api_error(root)
             _LOGGER.error("SecureControls: login rejected (C=%s EC=%s) %s EA=%s", c, ec, msg, ea)
-            if c == 203 and ec == 2:
+            if c == AUTH_ERROR_CODE and ec == AUTH_ERROR_SUBCODE:
+                self._auth_rejected = True
                 raise InvalidAuth("Login rejected: credentials/session invalid (C=203 EC=2)")
             raise ServerRejected(c, ec, ea)
 
@@ -247,10 +244,14 @@ class SecureControlsClient:
         self._session_id = si
         self._session_ts = d.get("JTT")
         self._user_id = d.get("UI")
+        self._auth_rejected = False
 
         _LOGGER.debug(
             "SecureControls: login ok. SI=%s UI=%s JTT=%s, GD count=%s",
-            self._session_id, self._user_id, self._session_ts, len(gd),
+            self._session_id,
+            self._user_id,
+            self._session_ts,
+            len(gd),
         )
 
         if not gd:
@@ -270,386 +271,150 @@ class SecureControlsClient:
         )
         _LOGGER.debug(
             "SecureControls: selected thermostat GMI=%s SN=%s HN=%s",
-            self.thermostat.gmi, self.thermostat.sn, self.thermostat.hn,
+            self.thermostat.gmi,
+            self.thermostat.sn,
+            self.thermostat.hn,
         )
 
-    # --------------- WebSocket lifecycle ---------------
-    def _ws_headers(self) -> Dict[str, str]:
+    # --------------- Short-lived WebSocket lifecycle ---------------
+    def _ws_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._jwt}",
             "Session-id": str(self._session_id),
             "Request-id": "1",
         }
 
-    async def connect(self) -> None:
+    async def _open_websocket(self) -> aiohttp.ClientWebSocketResponse:
+        if self._auth_rejected:
+            raise InvalidAuth(
+                "Beanbag authentication was rejected; reload the integration to sign in again"
+            )
+        if not self._jwt or not self._session_id:
+            raise InvalidAuth("Call login() before sending a request")
         if not self.thermostat:
             raise RuntimeError("Call login() first")
 
-        self._stop.clear()
         _LOGGER.debug("SecureControls: opening WebSocket to %s", WS_URL)
-        self._ws = await self._http.ws_connect(
-            WS_URL,
-            headers=self._ws_headers(),
-            protocols=[WS_SUBPROTOCOL],
-            heartbeat=None,  # we handle keepalive via time.tick op
-            autoping=True,
-        )
-        self._last_rx_ts = self._now_epoch()  # mark WS activity
-        _LOGGER.debug("SecureControls: WebSocket connected (protocol=%s)", WS_SUBPROTOCOL)
+        try:
+            websocket = await self._http.ws_connect(
+                WS_URL,
+                headers=self._ws_headers(),
+                protocols=[WS_SUBPROTOCOL],
+                heartbeat=None,
+                autoping=True,
+            )
+        except aiohttp.WSServerHandshakeError as err:
+            if err.status in (401, 403):
+                self._auth_rejected = True
+                raise InvalidAuth(
+                    "Beanbag WebSocket authentication was rejected; reload the integration"
+                ) from err
+            raise CannotConnect(f"WebSocket handshake failed: HTTP {err.status}") from err
+        except aiohttp.ClientError as err:
+            raise CannotConnect(f"WebSocket connection failed: {err}") from err
 
-        self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
-        self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
+        self._ws = websocket
+        _LOGGER.debug("SecureControls: WebSocket connected (protocol=%s)", WS_SUBPROTOCOL)
+        return websocket
+
+    async def _close_websocket(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
+        if self._ws is websocket:
+            self._ws = None
+        if not websocket.closed:
+            with contextlib.suppress(Exception):
+                await websocket.close()
 
     async def disconnect(self) -> None:
-        self._stop.set()
-        _LOGGER.debug("SecureControls: disconnect requested")
+        """Close an in-flight short-lived socket during integration unload."""
+        websocket = self._ws
+        if websocket is not None:
+            await self._close_websocket(websocket)
 
-        if self._ping_task:
-            self._ping_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._ping_task
-            self._ping_task = None
-
-        if self._recv_task:
-            self._recv_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._recv_task
-            self._recv_task = None
-
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
-
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(asyncio.CancelledError())
-        self._pending.clear()
-
-    async def _relogin_and_reconnect(self, reason: str) -> None:
-        """
-        Re-login with cached credentials (if present) and reconnect WS.
-        Falls back to plain reconnect if creds are missing.
-        """
-        if self._stop.is_set():
-            _LOGGER.debug("SecureControls: relogin skipped; client is stopping")
-            return
-
-        if not (self._email and self._password):
-            _LOGGER.debug("SecureControls: no cached creds; falling back to reconnect (%s)", reason)
-            await self._reconnect(reason)
-            return
-
-        async with self._reconnect_lock:
-            _LOGGER.warning("SecureControls: attempting re-login (%s)", reason)
-
-            # Cleanup old tasks/socket similar to _reconnect
-            if self._ping_task:
-                self._ping_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._ping_task
-                self._ping_task = None
-
-            if self._recv_task:
-                self._recv_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._recv_task
-                self._recv_task = None
-
-            if self._ws and not self._ws.closed:
-                with contextlib.suppress(Exception):
-                    await self._ws.close()
-            self._ws = None
-
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    fut.set_exception(RuntimeError("Re-login in progress; request cancelled"))
-            self._pending.clear()
-
-            attempt = 0
-            while not self._stop.is_set():
-                attempt += 1
-                if attempt > 1:
-                    base = min(30, 2 ** (attempt - 2))  # 1,2,4,8,16,30,30...
-                    jitter = (secrets.randbelow(1000) / 1000.0)
-                    delay = base + jitter
-                    _LOGGER.debug("SecureControls: re-login backoff %.2fs (attempt %s)", delay, attempt)
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                        _LOGGER.debug("SecureControls: re-login aborted due to stop")
-                        return
-                    except asyncio.TimeoutError:
-                        pass
-
-                try:
-                    await self.login(self._email, self._password)
-                    _LOGGER.info("SecureControls: login refreshed; reconnecting WS")
-
-                    self._ws = await self._http.ws_connect(
-                        WS_URL,
-                        headers=self._ws_headers(),
-                        protocols=[WS_SUBPROTOCOL],
-                        heartbeat=None,
-                        autoping=True,
-                    )
-                    self._last_rx_ts = self._now_epoch()
-                    _LOGGER.info("SecureControls: WebSocket reconnected after re-login (attempt %s)", attempt)
-
-                    self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
-                    self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
-                    return
-
-                except InvalidAuth as e:
-                    _LOGGER.error("SecureControls: re-login rejected: %s", e)
-                    raise  # Bubble up so caller can handle bad credentials
-                except aiohttp.ClientError as e:
-                    _LOGGER.warning("SecureControls: WS connect error after re-login: %s; will retry", e)
-                except Exception as e:
-                    _LOGGER.exception("SecureControls: unexpected error during re-login reconnect: %s", e)
-
-            _LOGGER.debug("SecureControls: re-login loop exited (stop set)")
-
-    async def _reconnect(self, reason: Optional[str] = None) -> None:
-        """
-        Tear down the current WS and re-establish it with exponential backoff.
-        Does NOT attempt to re-login unless handshake indicates auth error, in
-        which case we will call _relogin_and_reconnect() if creds are cached.
-        """
-        if self._stop.is_set():
-            _LOGGER.debug("SecureControls: reconnect skipped; client is stopping")
-            return
-
-        async with self._reconnect_lock:
-            # If another task already reconnected us, bail.
-            if self._ws and not self._ws.closed and self._recv_task and not self._recv_task.done():
-                _LOGGER.debug("SecureControls: reconnect not needed (WS alive)")
-                return
-
-            if reason:
-                _LOGGER.warning("SecureControls: reconnecting WS (%s)", reason)
-            else:
-                _LOGGER.warning("SecureControls: reconnecting WS")
-
-            # Best-effort cleanup of old tasks/socket
-            if self._ping_task:
-                self._ping_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._ping_task
-                self._ping_task = None
-
-            if self._recv_task:
-                self._recv_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._recv_task
-                self._recv_task = None
-
-            if self._ws and not self._ws.closed:
-                with contextlib.suppress(Exception):
-                    await self._ws.close()
-            self._ws = None
-
-            # Fail any in-flight requests so callers aren't left hanging
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    fut.set_exception(RuntimeError("WebSocket reconnecting; request cancelled"))
-            self._pending.clear()
-
-            # Retry loop with backoff
-            attempt = 0
-            while not self._stop.is_set():
-                attempt += 1
-                # Immediate first attempt; then 1,2,4,8,... up to 30s + small jitter
-                if attempt > 1:
-                    base = min(30, 2 ** (attempt - 2))  # 1,2,4,8,16,30,30...
-                    jitter = (secrets.randbelow(1000) / 1000.0)  # 0..1 second
-                    delay = base + jitter
-                    _LOGGER.debug("SecureControls: reconnect backoff %.2fs (attempt %s)", delay, attempt)
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                        _LOGGER.debug("SecureControls: reconnect aborted due to stop")
-                        return
-                    except asyncio.TimeoutError:
-                        pass
-
-                try:
-                    if not self._jwt or not self._session_id:
-                        # No session state; try full re-login if we can
-                        if self._email and self._password:
-                            await self._relogin_and_reconnect("missing jwt/session")
-                            return
-                        raise InvalidAuth("Missing JWT/session for reconnect")
-
-                    _LOGGER.debug("SecureControls: opening WebSocket (reconnect attempt %s)", attempt)
-                    self._ws = await self._http.ws_connect(
-                        WS_URL,
-                        headers=self._ws_headers(),
-                        protocols=[WS_SUBPROTOCOL],
-                        heartbeat=None,
-                        autoping=True,
-                    )
-                    self._last_rx_ts = self._now_epoch()
-                    _LOGGER.info("SecureControls: WebSocket reconnected on attempt %s", attempt)
-
-                    # Restart background tasks
-                    self._recv_task = asyncio.create_task(self._recv_loop(), name="bbbo-recv")
-                    self._ping_task = asyncio.create_task(self._keepalive_loop(), name="bbbo-keepalive")
-                    return
-
-                except aiohttp.WSServerHandshakeError as e:
-                    if e.status in (401, 403):
-                        _LOGGER.error("SecureControls: WS handshake unauthorized (%s); will try re-login", e.status)
-                        await self._relogin_and_reconnect(f"ws unauthorized {e.status}")
-                        return
-                    _LOGGER.warning("SecureControls: WS handshake error %s; will retry", e.status)
-                except aiohttp.ClientError as e:
-                    _LOGGER.warning("SecureControls: WS connect error: %s; will retry", e)
-                except Exception as e:
-                    _LOGGER.exception("SecureControls: unexpected error during reconnect: %s", e)
-
-            _LOGGER.debug("SecureControls: reconnect loop exited (stop set)")
-
-    async def _recv_loop(self) -> None:
-        assert self._ws is not None
-        try:
-            async for msg in self._ws:
-                # update last RX timestamp on any frame
-                self._last_rx_ts = self._now_epoch()
-
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                try:
-                    payload = json.loads(cast(str, msg.data))
-                except json.JSONDecodeError:
-                    _LOGGER.debug("SecureControls: non-JSON WS frame: %s", str(msg.data)[:120])
-                    continue
-
-                corr = payload.get("I")
-                if corr and ("R" in payload or "E" in payload):
-                    fut = self._pending.pop(corr, None)
-                    if fut and not fut.done():
-                        if "R" in payload:
-                            fut.set_result(payload["R"])
-                        else:
-                            err_obj = payload.get("E") or {}
-                            c, ec, ea, msgtxt = _decode_api_error(err_obj)
-                            _LOGGER.warning(
-                                "SecureControls: WS error reply (C=%s EC=%s) %s EA=%s",
-                                c, ec, msgtxt, ea
-                            )
-                            if c == 203 and ec == 2:
-                                # Session/JWT rejected -> raise InvalidAuth and try to recover
-                                fut.set_exception(InvalidAuth("Session/JWT rejected (C=203 EC=2)"))
-                                # Try to refresh creds if we have them; otherwise plain reconnect
-                                if self._email and self._password:
-                                    asyncio.create_task(self._relogin_and_reconnect("auth/session rejected"))
-                                else:
-                                    asyncio.create_task(self._reconnect("auth/session rejected"))
-                            else:
-                                fut.set_exception(ServerRejected(c, ec, ea))
-                    continue
-
-                if payload.get("M") == "Notify":
-                    await self._dispatch_notify(payload)
-                    continue
-
-                _LOGGER.debug("SecureControls: unhandled WS payload: %s", json.dumps(payload)[:400])
-        except Exception as e:
-            _LOGGER.warning("SecureControls: recv loop terminated: %s", e)
-            # Try to reconnect unless stopping
-            if not self._stop.is_set():
-                with contextlib.suppress(Exception):
-                    if self._email and self._password:
-                        await self._relogin_and_reconnect("recv loop error")
-                    else:
-                        await self._reconnect("recv loop error")
-
-    async def _keepalive_loop(self) -> None:
-        stale_after = 180  # seconds without RX before we reconnect (tunable)
-        while not self._stop.is_set():
-            try:
-                # Fire-and-forget tick so we don't hang the loop if replies are dropped
-                await self.time_tick_ff()
-            except Exception as e:
-                _LOGGER.debug("SecureControls: keepalive tick failed: %s", e)
-
-            # Stale socket detection -> reconnect or relogin+reconnect
-            try:
-                if self._last_rx_ts and (self._now_epoch() - self._last_rx_ts > stale_after):
-                    _LOGGER.warning(
-                        "SecureControls: WS appears stale (no RX >%ss); attempting reconnect",
-                        stale_after,
-                    )
-                    if self._email and self._password:
-                        await self._relogin_and_reconnect("stale socket")
-                    else:
-                        await self._reconnect("stale socket")
-            except Exception as e:
-                _LOGGER.debug("SecureControls: keepalive stale-check error: %s", e)
-
-            await asyncio.sleep(self._keepalive_secs)
-
-    # --------------- Envelope + send ---------------
-    async def _send_request(self, *, hi: int, si: int, args: Optional[List[Any]] = None) -> Any:
-        if not self._ws or self._ws.closed:
-            raise RuntimeError("WebSocket not connected")
+    # --------------- Transactional request/response ---------------
+    async def _send_request(self, *, hi: int, si: int, args: list[Any] | None = None) -> Any:
         if not self.thermostat:
             raise RuntimeError("No thermostat selected")
+        if self._auth_rejected:
+            raise InvalidAuth(
+                "Beanbag authentication was rejected; reload the integration to sign in again"
+            )
 
-        corr = self._new_corr()
-        env: Json = {
-            "V": "1.0",
-            "DTS": self._now_epoch(),
-            "I": corr,
-            "M": "Request",
-            "P": [
-                {"GMI": int(self.thermostat.gmi), "HI": hi, "SI": si},
-            ],
-        }
-        if args is not None:
-            env["P"].append(args)
+        async with self._operation_lock:
+            # Re-check after waiting for another operation, which may have latched
+            # an authentication rejection.
+            if self._auth_rejected:
+                raise InvalidAuth(
+                    "Beanbag authentication was rejected; reload the integration to sign in again"
+                )
 
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[corr] = fut
-        await self._ws.send_json(env)
-        _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
-        return await fut
+            corr = self._new_corr()
+            env: Json = {
+                "V": "1.0",
+                "DTS": self._now_epoch(),
+                "I": corr,
+                "M": "Request",
+                "P": [
+                    {"GMI": int(self.thermostat.gmi), "HI": hi, "SI": si},
+                ],
+            }
+            if args is not None:
+                env["P"].append(args)
 
-    async def _send_fire_and_forget(self, *, hi: int, si: int, args: Optional[List[Any]] = None) -> None:
-        if not self._ws or self._ws.closed:
-            raise RuntimeError("WebSocket not connected")
-        if not self.thermostat:
-            raise RuntimeError("No thermostat selected")
+            websocket = await self._open_websocket()
+            try:
+                await websocket.send_json(env)
+                _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
 
-        env: Json = {
-            "V": "1.0",
-            "DTS": self._now_epoch(),
-            "I": self._new_corr(),
-            "M": "Request",
-            "P": [
-                {"GMI": int(self.thermostat.gmi), "HI": hi, "SI": si},
-            ],
-        }
-        if args is not None:
-            env["P"].append(args)
-        await self._ws.send_json(env)
+                async with asyncio.timeout(WS_RESPONSE_TIMEOUT_SECS):
+                    while True:
+                        message = await websocket.receive()
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(str(message.data))
+                            except json.JSONDecodeError:
+                                _LOGGER.debug(
+                                    "SecureControls: ignoring non-JSON WS frame: %s",
+                                    str(message.data)[:120],
+                                )
+                                continue
 
-    # --------------- Notify / push ---------------
-    async def _dispatch_notify(self, payload: Json) -> None:
-        try:
-            self._updates_q.put_nowait(payload)
-        except asyncio.QueueFull:
-            with contextlib.suppress(Exception):
-                _ = self._updates_q.get_nowait()
-            await self._updates_q.put(payload)
+                            if not isinstance(payload, dict) or payload.get("I") != corr:
+                                continue
+                            if "R" in payload:
+                                return payload["R"]
+                            if "E" in payload:
+                                err_obj = payload.get("E") or {}
+                                c, ec, ea, msgtxt = _decode_api_error(err_obj)
+                                _LOGGER.warning(
+                                    "SecureControls: WS error reply (C=%s EC=%s) %s EA=%s",
+                                    c,
+                                    ec,
+                                    msgtxt,
+                                    ea,
+                                )
+                                if c == AUTH_ERROR_CODE and ec == AUTH_ERROR_SUBCODE:
+                                    self._auth_rejected = True
+                                    raise InvalidAuth(
+                                        "Beanbag session was rejected; reload the integration"
+                                    )
+                                raise ServerRejected(c, ec, ea)
+                            raise CannotConnect("WebSocket response missing result payload")
 
-        for h in self._handlers:
-            asyncio.create_task(h(payload))
-
-    def on_update(self, handler: UpdateHandler) -> None:
-        self._handlers.append(handler)
-
-    async def updates(self) -> AsyncIterator[Json]:
-        while True:
-            yield await self._updates_q.get()
+                        if message.type in {
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            raise CannotConnect("WebSocket closed before the response arrived")
+            except TimeoutError as err:
+                raise CannotConnect(
+                    f"WebSocket response timed out after {WS_RESPONSE_TIMEOUT_SECS} seconds"
+                ) from err
+            except aiohttp.ClientError as err:
+                raise CannotConnect(f"WebSocket request failed: {err}") from err
+            finally:
+                await self._close_websocket(websocket)
 
     # --------------- Reads (HI/SI pairs) ---------------
     async def zones_read(self) -> Any:
@@ -657,12 +422,8 @@ class SecureControlsClient:
         return await self._send_request(hi=49, si=11)
 
     async def time_tick(self) -> Any:
-        # 2/103 with [epochSeconds] — request/response variant
+        # 2/103 with [epochSeconds]
         return await self._send_request(hi=2, si=103, args=[self._now_epoch()])
-
-    async def time_tick_ff(self) -> None:
-        """Fire-and-forget keepalive tick (recommended)."""
-        await self._send_fire_and_forget(hi=2, si=103, args=[self._now_epoch()])
 
     async def device_metadata_read(self) -> Any:
         # 17/11
@@ -705,7 +466,7 @@ class SecureControlsClient:
         """Alias that makes intent explicit."""
         return await self.set_mode(heat)
 
-    async def set_preset(self, preset: Union[str, int]) -> Any:
+    async def set_preset(self, preset: str | int) -> Any:
         """
         Set preset (I:6): 1=away, 2=home.
         Accepts either 'away'/'home' (case-insensitive) or 1/2.
@@ -727,11 +488,3 @@ class SecureControlsClient:
     async def set_timed_hold(self, celsius: float, minutes: int) -> Any:
         # Timed override on target (I:1, OT:2) for D:<minutes>
         return await self._write_item(ITEM_TARGET, self.c_to_deci(celsius), ot=2, d=int(minutes))
-
-    # --------------- Context manager ---------------
-    async def __aenter__(self) -> "SecureControlsClient":
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.disconnect()
