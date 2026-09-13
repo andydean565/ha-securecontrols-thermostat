@@ -205,7 +205,7 @@ async def test_login_no_devices_raises_api_error(session):
 
 
 @pytest.mark.asyncio
-async def test_request_uses_expected_headers_correlates_and_closes(session, monkeypatch):
+async def test_request_uses_expected_headers_correlates_and_stays_open(session, monkeypatch):
     client = _authenticated_client(session)
     monkeypatch.setattr(SecureControlsClient, "_now_epoch", staticmethod(lambda: 1700000000))
     monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "42-deadbeef")
@@ -215,8 +215,8 @@ async def test_request_uses_expected_headers_correlates_and_closes(session, monk
     result = await client.device_metadata_read()
 
     assert result == {"ok": 1}
-    assert websocket.closed is True
-    assert client._ws is None
+    assert websocket.closed is False
+    assert client._ws is websocket
     assert calls[0]["url"] == WS_URL
     assert calls[0]["headers"]["Authorization"] == "Bearer jwt"
     assert calls[0]["headers"]["Session-id"] == "42"
@@ -226,6 +226,27 @@ async def test_request_uses_expected_headers_correlates_and_closes(session, monk
     assert sent["I"] == "42-deadbeef"
     assert sent["DTS"] == 1700000000
     assert sent["P"][0] == {"GMI": 1001, "HI": 17, "SI": 11}
+
+
+@pytest.mark.asyncio
+async def test_two_polls_reuse_one_login_and_one_websocket(session, monkeypatch):
+    client = _authenticated_client(session)
+    correlations = iter(("42-first", "42-second"))
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: next(correlations))
+    websocket = FakeWS(
+        [
+            {"I": "42-first", "R": {"poll": 1}},
+            {"I": "42-second", "R": {"poll": 2}},
+        ]
+    )
+    calls = _patch_websockets(monkeypatch, [websocket])
+
+    assert await client.state_read() == {"poll": 1}
+    assert await client.state_read() == {"poll": 2}
+
+    assert len(calls) == 1
+    assert websocket.closed is False
+    assert client._ws is websocket
 
 
 @pytest.mark.asyncio
@@ -243,7 +264,23 @@ async def test_request_ignores_unrelated_notify_and_non_json_frames(session, mon
     _patch_websockets(monkeypatch, [websocket])
 
     assert await client.state_read() == {"ok": True}
+    assert websocket.closed is False
+
+
+@pytest.mark.asyncio
+async def test_disconnect_closes_established_socket(session, monkeypatch):
+    client = _authenticated_client(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "42-ok")
+    websocket = FakeWS([{"I": "42-ok", "R": {"ok": True}}])
+    _patch_websockets(monkeypatch, [websocket])
+
+    assert await client.state_read() == {"ok": True}
+    assert websocket.closed is False
+
+    await client.disconnect()
+
     assert websocket.closed is True
+    assert client._ws is None
 
 
 @pytest.mark.asyncio
@@ -275,6 +312,41 @@ async def test_auth_rejection_latches_and_stops_network_activity(session, monkey
     assert websocket.closed is True
     assert client._auth_rejected is True
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_lost_established_session_reconnect_rejection_latches(session, monkeypatch):
+    client = _authenticated_client(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "42-ok")
+    established = FakeWS([{"I": "42-ok", "R": {"ok": True}}])
+    attempts = 0
+
+    async def fake_ws_connect(_session, _url, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return established
+        raise aiohttp.WSServerHandshakeError(None, (), status=403, message="Forbidden")
+
+    monkeypatch.setattr(aiohttp.ClientSession, "ws_connect", fake_ws_connect)
+
+    assert await client.state_read() == {"ok": True}
+    assert attempts == 1
+
+    # The established session drops unexpectedly (e.g. the mobile app reclaimed it).
+    established._incoming.append(_WSMsg(msg_type=aiohttp.WSMsgType.CLOSED))
+    with pytest.raises(CannotConnect):
+        await client.state_read()
+    assert attempts == 1  # reused the existing socket; no reconnect attempted here
+
+    # Beanbag refuses a second socket on the same session: latch, don't keep retrying.
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+
+    assert client._auth_rejected is True
+    assert attempts == 2
 
 
 @pytest.mark.asyncio
@@ -329,7 +401,8 @@ async def test_transport_failure_does_not_login_or_latch_and_next_poll_can_retry
     client.login.assert_not_awaited()
     assert client._auth_rejected is False
     assert attempts == 2
-    assert websocket.closed is True
+    assert websocket.closed is False
+    assert client._ws is websocket
 
 
 @pytest.mark.asyncio
@@ -380,28 +453,37 @@ async def test_request_cancellation_closes_socket(session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_requests_are_serialized(session, monkeypatch):
+async def test_concurrent_requests_are_serialized_on_one_connection(session, monkeypatch):
     client = _authenticated_client(session)
     correlations = iter(("42-first", "42-second"))
     monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: next(correlations))
     release_first = asyncio.Event()
-    first = FakeWS([{"I": "42-first", "R": {"request": 1}}], receive_gate=release_first)
-    second = FakeWS([{"I": "42-second", "R": {"request": 2}}])
-    calls = _patch_websockets(monkeypatch, [first, second])
+    websocket = FakeWS(
+        [
+            {"I": "42-first", "R": {"request": 1}},
+            {"I": "42-second", "R": {"request": 2}},
+        ],
+        receive_gate=release_first,
+    )
+    calls = _patch_websockets(monkeypatch, [websocket])
 
     first_task = asyncio.create_task(client.state_read())
-    while not first.sent:
+    while not websocket.sent:
         await asyncio.sleep(0)
     second_task = asyncio.create_task(client.device_config_read())
     await asyncio.sleep(0)
 
     assert len(calls) == 1
+    assert len(websocket.sent) == 1  # second request waits on the lock, not a new socket
+
     release_first.set()
     assert await first_task == {"request": 1}
     assert await second_task == {"request": 2}
-    assert len(calls) == 2
-    assert first.closed is True
-    assert second.closed is True
+
+    assert len(calls) == 1
+    assert len(websocket.sent) == 2
+    assert websocket.closed is False
+    assert client._ws is websocket
 
 
 @pytest.mark.asyncio
@@ -456,4 +538,4 @@ async def test_write_payloads(
         "OT": expected_ot,
         "D": expected_duration,
     }
-    assert websocket.closed is True
+    assert websocket.closed is False

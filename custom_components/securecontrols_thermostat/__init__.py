@@ -32,7 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # ConfigEntryNotReady triggers HA to retry setup later
         raise ConfigEntryNotReady(f"Login failed: {err}") from err
 
-    # Create a single shared coordinator; each refresh uses one short-lived WS.
+    # Create a single shared coordinator; refreshes reuse one persistent WS.
     coordinator = ThermoCoordinator(hass, client)
     await coordinator.async_config_entry_first_refresh()
 

@@ -30,7 +30,7 @@ PRESET_HOME = 2
 
 
 class ThermoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator that polls through short-lived WebSocket transactions."""
+    """Coordinator that polls over the client's persistent WebSocket."""
 
     def __init__(self, hass: HomeAssistant, client) -> None:
         super().__init__(
