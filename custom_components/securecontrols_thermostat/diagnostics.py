@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_GATEWAY_GMI
+from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN
 
 # Redact sensitive fields
 TO_REDACT = {
@@ -15,9 +14,8 @@ TO_REDACT = {
     "session_id",
 }
 
-async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry
-):
+
+async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry):
     """Return diagnostics for a config entry."""
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
 
@@ -41,13 +39,14 @@ async def async_get_config_entry_diagnostics(
             "dn": thermo.dn,
         }
 
-    # Optional: include cached websocket state
+    # Include connection state without exposing session identifiers.
     if client:
         diagnostics["session"] = {
+            "connection_mode": "short_lived_polling",
             "connected": bool(client._ws and not client._ws.closed),
             "jwt_present": bool(client._jwt),
-            "session_id": client._session_id,
-            "last_tick": getattr(client, "_session_ts", None),
+            "auth_rejected": bool(getattr(client, "_auth_rejected", False)),
+            "login_timestamp": getattr(client, "_session_ts", None),
         }
 
     return diagnostics

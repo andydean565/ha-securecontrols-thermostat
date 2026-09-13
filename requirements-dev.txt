@@ -1,2 +1,6 @@
+aiohttp
+aioresponses
+homeassistant
 pytest
+pytest-asyncio
 ruff

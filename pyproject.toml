@@ -14,5 +14,5 @@ ignore = ["PLR0913","PLR0912","PLR0915"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+pythonpath = ["."]
 testpaths = ["tests"]
-

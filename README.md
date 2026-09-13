@@ -7,18 +7,18 @@
 
 A custom [Home Assistant](https://www.home-assistant.io) integration for **Secure Controls smart thermostats**, connecting via the official **Beanbag Cloud API** and **WebSocket** interface.
 
-This integration enables real-time two-way communication with Secure thermostats — providing temperature, humidity, power data, and full remote control directly from Home Assistant.
+This integration provides cloud-based two-way communication with Secure thermostats — including temperature, humidity, power data, and remote control from Home Assistant.
 
 ---
 
 ## ✨ Features
 
 - 🔐 Secure authentication using your Beanbag account  
-- 🌡️ Real-time temperature, humidity, and power updates  
+- 🌡️ Temperature, humidity, and power updates every 45 seconds
 - ⚙️ Control target temperature, mode, and preset  
 - ⚡ Power usage telemetry (where supported)  
 - 🧱 Multi-gateway support  
-- 🔄 Automatic reconnect and session management  
+- 🔐 Short-lived cloud connections that do not monopolize your account session
 - 🧩 Exposes native Home Assistant entities:
   - `climate` — main thermostat
   - `sensor` — humidity and power metrics
@@ -54,7 +54,7 @@ This integration enables real-time two-way communication with Secure thermostats
 4. The integration will:
    - Authenticate using the Secure Controls API  
    - Discover your gateways and thermostats  
-   - Open a WebSocket for real-time updates  
+   - Poll the thermostat every 45 seconds using a short-lived WebSocket
 
 [![Add to Home Assistant](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=securecontrols_thermostat)
 
@@ -70,16 +70,27 @@ POST /api/UserRestAPI/LoginRequest
 Payload includes MD5-hashed password; returns a JWT (`JT`) and Session ID (`SI`).
 
 ### WebSocket Control
-All device control and telemetry occur over WebSocket:
+All device control and telemetry use short-lived WebSocket transactions. The
+integration opens a socket for one read or command and closes it as soon as the
+matching response arrives. It does not keep a permanent cloud connection open.
 
 ```
-wss://app.beanbag.online/ws
+wss://app.beanbag.online/api/TransactionRestAPI/ConnectWebSocket
 Headers:
   Authorization: Bearer <JWT>
-  X-Session-Id: <SessionId>
+  Session-id: <SessionId>
+Subprotocol:
+  BB-BO-01
 ```
 
-The client sends and receives JSON messages for subscription, telemetry, and commands.
+This polling model means Home Assistant state can be up to 45 seconds behind the
+thermostat, but it leaves the WebSocket free between operations so the Secure
+Controls app can sign in normally.
+
+If signing into the Secure Controls app invalidates Home Assistant's Beanbag
+session, the integration deliberately stops making cloud requests. Reload the
+integration from **Settings → Devices & services** when you want Home Assistant
+to sign in again. It will not automatically reclaim the session from the app.
 
 Example telemetry payload:
 ```json
