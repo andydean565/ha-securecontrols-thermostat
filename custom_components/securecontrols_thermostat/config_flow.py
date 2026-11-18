@@ -79,6 +79,40 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         })
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
+    async def async_step_reauth(self, entry_data: Dict[str, Any]) -> FlowResult:
+        """Start reauth after Beanbag rejected the stored session/credentials."""
+        self._email = entry_data.get(CONF_EMAIL)
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: Optional[Dict[str, Any]] = None
+    ) -> FlowResult:
+        errors: Dict[str, str] = {}
+        entry = self._get_reauth_entry()
+
+        if user_input is not None:
+            client = SecureControlsClient(async_get_clientsession(self.hass))
+            try:
+                await client.login(entry.data[CONF_EMAIL], user_input[CONF_PASSWORD])
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error during SecureControls reauth")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
+            description_placeholders={"email": entry.data[CONF_EMAIL]},
+            errors=errors,
+        )
+
     async def async_step_select_gateway(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
         errors: Dict[str, str] = {}
 

@@ -539,3 +539,117 @@ async def test_write_payloads(
         "D": expected_duration,
     }
     assert websocket.closed is False
+
+
+def _client_with_credentials(session: aiohttp.ClientSession) -> SecureControlsClient:
+    client = _authenticated_client(session)
+    client._credentials = ("user@example.com", "secret")
+
+    async def fake_login(email: str, password: str) -> None:
+        client._jwt = "jwt-fresh"
+        client._session_id = 43
+
+    client.login = AsyncMock(side_effect=fake_login)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_session_rejection_relogs_in_once_and_retries(session, monkeypatch):
+    client = _client_with_credentials(session)
+    stale = FakeWS([{"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}])
+    fresh = FakeWS([{"I": "corr", "R": {"ok": True}}])
+    calls = _patch_websockets(monkeypatch, [stale, fresh])
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+
+    assert await client.state_read() == {"ok": True}
+
+    client.login.assert_awaited_once_with("user@example.com", "secret")
+    assert stale.closed is True
+    assert client._ws is fresh
+    assert client._auth_rejected is False
+    assert calls[1]["headers"]["Authorization"] == "Bearer jwt-fresh"
+    assert calls[1]["headers"]["Session-id"] == "43"
+
+
+@pytest.mark.asyncio
+async def test_handshake_rejection_relogs_in_and_retries(session, monkeypatch):
+    client = _client_with_credentials(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    fresh = FakeWS([{"I": "corr", "R": {"ok": True}}])
+    attempts = 0
+
+    async def fake_ws_connect(_session, _url, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise aiohttp.WSServerHandshakeError(None, (), status=401, message="Unauthorized")
+        return fresh
+
+    monkeypatch.setattr(aiohttp.ClientSession, "ws_connect", fake_ws_connect)
+
+    assert await client.state_read() == {"ok": True}
+    client.login.assert_awaited_once()
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_rejected_fresh_session_latches(session, monkeypatch):
+    client = _client_with_credentials(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    reject = {"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}
+    calls = _patch_websockets(monkeypatch, [FakeWS([reject]), FakeWS([reject])])
+
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+
+    client.login.assert_awaited_once()
+    assert client._auth_rejected is True
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_relogin_respects_cooldown(session, monkeypatch):
+    client = _client_with_credentials(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    reject = {"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}
+    _patch_websockets(
+        monkeypatch,
+        [FakeWS([reject]), FakeWS([{"I": "corr", "R": {"ok": 1}}]), FakeWS([reject])],
+    )
+
+    assert await client.state_read() == {"ok": 1}
+    client._ws._incoming.append(_WSMsg(msg_type=aiohttp.WSMsgType.CLOSED))
+    with pytest.raises(CannotConnect):
+        await client.state_read()
+
+    # Second rejection inside the cooldown window: no further login, latch instead.
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+    client.login.assert_awaited_once()
+    assert client._auth_rejected is True
+
+
+@pytest.mark.asyncio
+async def test_relogin_with_rejected_credentials_latches(session, monkeypatch):
+    client = _authenticated_client(session)
+    client._credentials = ("user@example.com", "changed")
+
+    async def rejected_login(_email: str, _password: str) -> None:
+        client._auth_rejected = True
+        raise InvalidAuth("bad credentials")
+
+    client.login = AsyncMock(side_effect=rejected_login)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    calls = _patch_websockets(
+        monkeypatch, [FakeWS([{"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}])]
+    )
+
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+    with pytest.raises(InvalidAuth):
+        await client.state_read()
+
+    client.login.assert_awaited_once()
+    assert len(calls) == 1
