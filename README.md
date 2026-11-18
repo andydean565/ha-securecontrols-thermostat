@@ -18,7 +18,7 @@ This integration provides cloud-based two-way communication with Secure thermost
 - ⚙️ Control target temperature, mode, and preset  
 - ⚡ Power usage telemetry (where supported)  
 - 🧱 Multi-gateway support  
-- 🔐 One retained cloud connection per session that latches and stops instead of fighting the mobile app for it
+- 🔐 One retained cloud connection, with a rate-limited automatic re-login when Beanbag drops the session
 - 🧩 Exposes native Home Assistant entities:
   - `climate` — main thermostat
   - `sensor` — humidity and power metrics
@@ -89,12 +89,16 @@ Subprotocol:
 Polling still happens every 45 seconds, but over that one retained connection
 rather than a fresh socket each time.
 
-Opening the Secure Controls mobile app can invalidate Home Assistant's Beanbag
-session — the two cannot reliably hold the session at the same time, and the
-integration deliberately stops making cloud requests rather than repeatedly
-signing back in and fighting the app for it. To hand the session back to Home
-Assistant, fully quit the mobile app and then reload the integration from
-**Settings → Devices & services**.
+When Beanbag drops or expires the session (the socket goes quiet, or a
+reconnect is answered with `C=203 EC=2`), the integration signs in once more
+with the stored credentials and retries. At most one such automatic re-login
+happens every 10 minutes, so it can never hammer the account. If the fresh
+session is rejected too, or the credentials themselves are refused, the
+integration stops making cloud requests and Home Assistant shows a
+**Re-authenticate** prompt under **Settings → Devices & services**.
+
+Opening the Secure Controls mobile app can invalidate Home Assistant's session;
+if that keeps happening, fully quit the mobile app before re-authenticating.
 
 Example telemetry payload:
 ```json

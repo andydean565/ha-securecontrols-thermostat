@@ -30,6 +30,10 @@ HTTP_OK = 200
 HTTP_SERVER_ERROR = 500
 AUTH_ERROR_CODE = 203
 AUTH_ERROR_SUBCODE = 2
+# Minimum gap between automatic re-logins after Beanbag drops a session. One
+# login with already-accepted credentials per window cannot trip the account
+# lockout, which is triggered by repeated rejected logins.
+RELOGIN_COOLDOWN_SECS = 600
 
 # Thermostat "block" constants (per your usage)
 THERMO_HI_WRITE = 2  # thermostat.state.write
@@ -75,6 +79,13 @@ class InvalidAuth(ApiError):
 
 class CannotConnect(ApiError):
     pass
+
+
+class SessionRejected(InvalidAuth):
+    """Beanbag rejected the current session/JWT (not the credentials).
+
+    Raised internally so the client can try one fresh login before latching.
+    """
 
 
 class ServerRejected(ApiError):
@@ -163,6 +174,11 @@ class SecureControlsClient:
         self._operation_lock = asyncio.Lock()
         self._auth_rejected = False
 
+        # Credentials accepted by the last successful login, used for a single
+        # bounded re-login when Beanbag expires or drops the session.
+        self._credentials: tuple[str, str] | None = None
+        self._last_relogin: float | None = None
+
     # --------------- Utilities ---------------
     @staticmethod
     def _now_epoch() -> int:
@@ -249,6 +265,7 @@ class SecureControlsClient:
         self._session_ts = d.get("JTT")
         self._user_id = d.get("UI")
         self._auth_rejected = False
+        self._credentials = (email, password)
 
         _LOGGER.debug(
             "SecureControls: login ok. SI=%s UI=%s JTT=%s, GD count=%s",
@@ -309,9 +326,8 @@ class SecureControlsClient:
             )
         except aiohttp.WSServerHandshakeError as err:
             if err.status in (401, 403):
-                self._auth_rejected = True
-                raise InvalidAuth(
-                    "Beanbag WebSocket authentication was rejected; reload the integration"
+                raise SessionRejected(
+                    f"Beanbag WebSocket handshake rejected the session (HTTP {err.status})"
                 ) from err
             raise CannotConnect(f"WebSocket handshake failed: HTTP {err.status}") from err
         except aiohttp.ClientError as err:
@@ -351,83 +367,124 @@ class SecureControlsClient:
                     "Beanbag authentication was rejected; reload the integration to sign in again"
                 )
 
-            corr = self._new_corr()
-            env: Json = {
-                "V": "1.0",
-                "DTS": self._now_epoch(),
-                "I": corr,
-                "M": "Request",
-                "P": [
-                    {"GMI": int(self.thermostat.gmi), "HI": hi, "SI": si},
-                ],
-            }
-            if args is not None:
-                env["P"].append(args)
-
-            websocket = self._ws
-            if websocket is None or websocket.closed:
-                websocket = await self._open_websocket()
-
-            success = False
             try:
-                await websocket.send_json(env)
-                _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
+                return await self._transact(hi=hi, si=si, args=args)
+            except SessionRejected as err:
+                if not self._may_relogin():
+                    self._auth_rejected = True
+                    raise InvalidAuth(
+                        "Beanbag session was rejected; reload the integration to sign in again"
+                    ) from err
+                _LOGGER.info("SecureControls: session rejected (%s); signing in again", err)
+                await self._relogin()
 
-                async with asyncio.timeout(WS_RESPONSE_TIMEOUT_SECS):
-                    while True:
-                        message = await websocket.receive()
-                        if message.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                payload = json.loads(str(message.data))
-                            except json.JSONDecodeError:
-                                _LOGGER.debug(
-                                    "SecureControls: ignoring non-JSON WS frame: %s",
-                                    str(message.data)[:120],
-                                )
-                                continue
-
-                            if not isinstance(payload, dict) or payload.get("I") != corr:
-                                continue
-                            if "R" in payload:
-                                success = True
-                                return payload["R"]
-                            if "E" in payload:
-                                err_obj = payload.get("E") or {}
-                                c, ec, ea, msgtxt = _decode_api_error(err_obj)
-                                _LOGGER.warning(
-                                    "SecureControls: WS error reply (C=%s EC=%s) %s EA=%s",
-                                    c,
-                                    ec,
-                                    msgtxt,
-                                    ea,
-                                )
-                                if c == AUTH_ERROR_CODE and ec == AUTH_ERROR_SUBCODE:
-                                    self._auth_rejected = True
-                                    raise InvalidAuth(
-                                        "Beanbag session was rejected; reload the integration"
-                                    )
-                                raise ServerRejected(c, ec, ea)
-                            raise CannotConnect("WebSocket response missing result payload")
-
-                        if message.type in {
-                            aiohttp.WSMsgType.CLOSE,
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.CLOSING,
-                            aiohttp.WSMsgType.ERROR,
-                        }:
-                            raise CannotConnect("WebSocket closed before the response arrived")
-            except TimeoutError as err:
-                raise CannotConnect(
-                    f"WebSocket response timed out after {WS_RESPONSE_TIMEOUT_SECS} seconds"
+            try:
+                return await self._transact(hi=hi, si=si, args=args)
+            except SessionRejected as err:
+                self._auth_rejected = True
+                raise InvalidAuth(
+                    "Beanbag rejected a freshly issued session; reload the integration"
                 ) from err
-            except aiohttp.ClientError as err:
-                raise CannotConnect(f"WebSocket request failed: {err}") from err
-            finally:
-                # Keep a successful transaction's socket open for reuse; any
-                # other outcome (error reply, timeout, transport loss,
-                # cancellation) leaves the socket unusable, so close it.
-                if not success:
-                    await self._close_websocket(websocket)
+
+    def _may_relogin(self) -> bool:
+        if self._credentials is None:
+            return False
+        if self._last_relogin is None:
+            return True
+        return time.monotonic() - self._last_relogin >= RELOGIN_COOLDOWN_SECS
+
+    async def _relogin(self) -> None:
+        """Fresh login with the last accepted credentials (caller holds the lock).
+
+        login() itself latches the client if the credentials are now rejected.
+        """
+        assert self._credentials is not None
+        self._last_relogin = time.monotonic()
+        stale = self._ws
+        if stale is not None:
+            await self._close_websocket(stale)
+        email, password = self._credentials
+        await self.login(email, password)
+
+    async def _transact(self, *, hi: int, si: int, args: list[Any] | None) -> Any:
+        """Send one request on the shared socket and wait for its reply (lock held)."""
+        assert self.thermostat is not None
+        corr = self._new_corr()
+        env: Json = {
+            "V": "1.0",
+            "DTS": self._now_epoch(),
+            "I": corr,
+            "M": "Request",
+            "P": [
+                {"GMI": int(self.thermostat.gmi), "HI": hi, "SI": si},
+            ],
+        }
+        if args is not None:
+            env["P"].append(args)
+
+        websocket = self._ws
+        if websocket is None or websocket.closed:
+            websocket = await self._open_websocket()
+
+        success = False
+        try:
+            await websocket.send_json(env)
+            _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
+
+            async with asyncio.timeout(WS_RESPONSE_TIMEOUT_SECS):
+                while True:
+                    message = await websocket.receive()
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(str(message.data))
+                        except json.JSONDecodeError:
+                            _LOGGER.debug(
+                                "SecureControls: ignoring non-JSON WS frame: %s",
+                                str(message.data)[:120],
+                            )
+                            continue
+
+                        if not isinstance(payload, dict) or payload.get("I") != corr:
+                            continue
+                        if "R" in payload:
+                            success = True
+                            return payload["R"]
+                        if "E" in payload:
+                            err_obj = payload.get("E") or {}
+                            c, ec, ea, msgtxt = _decode_api_error(err_obj)
+                            _LOGGER.warning(
+                                "SecureControls: WS error reply (C=%s EC=%s) %s EA=%s",
+                                c,
+                                ec,
+                                msgtxt,
+                                ea,
+                            )
+                            if c == AUTH_ERROR_CODE and ec == AUTH_ERROR_SUBCODE:
+                                raise SessionRejected(
+                                    "Beanbag rejected the session (C=203 EC=2)"
+                                )
+                            raise ServerRejected(c, ec, ea)
+                        raise CannotConnect("WebSocket response missing result payload")
+
+                    if message.type in {
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.ERROR,
+                    }:
+                        raise CannotConnect("WebSocket closed before the response arrived")
+        except TimeoutError as err:
+            raise CannotConnect(
+                f"WebSocket response timed out after {WS_RESPONSE_TIMEOUT_SECS} seconds"
+            ) from err
+        except aiohttp.ClientError as err:
+            raise CannotConnect(f"WebSocket request failed: {err}") from err
+        finally:
+            # Keep a successful transaction's socket open for reuse; any
+            # other outcome (error reply, timeout, transport loss,
+            # cancellation) leaves the socket unusable, so close it.
+            if not success:
+                await self._close_websocket(websocket)
 
     # --------------- Reads (HI/SI pairs) ---------------
     async def zones_read(self) -> Any:
