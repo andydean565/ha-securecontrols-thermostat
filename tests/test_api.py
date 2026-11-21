@@ -593,42 +593,90 @@ async def test_handshake_rejection_relogs_in_and_retries(session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rejected_fresh_session_latches(session, monkeypatch):
+async def test_rejected_fresh_session_backs_off_without_latching(session, monkeypatch):
     client = _client_with_credentials(session)
     monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
     reject = {"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}
     calls = _patch_websockets(monkeypatch, [FakeWS([reject]), FakeWS([reject])])
 
-    with pytest.raises(InvalidAuth):
+    with pytest.raises(CannotConnect, match="20 minutes"):
         await client.state_read()
-    with pytest.raises(InvalidAuth):
+    # Inside the cooldown: no network activity, still retryable, not latched.
+    with pytest.raises(CannotConnect, match="waiting"):
         await client.state_read()
 
     client.login.assert_awaited_once()
-    assert client._auth_rejected is True
+    assert client._auth_rejected is False
+    assert client._relogin_cooldown == 1200
     assert len(calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_relogin_respects_cooldown(session, monkeypatch):
+async def test_stale_session_relogs_in_after_cooldown_and_recovers(session, monkeypatch):
     client = _client_with_credentials(session)
     monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
     reject = {"I": "corr", "E": {"C": 203, "EC": 2, "EA": {}}}
     _patch_websockets(
         monkeypatch,
-        [FakeWS([reject]), FakeWS([{"I": "corr", "R": {"ok": 1}}]), FakeWS([reject])],
+        [FakeWS([reject]), FakeWS([reject]), FakeWS([{"I": "corr", "R": {"ok": 1}}])],
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "custom_components.securecontrols_thermostat.api.time.monotonic", lambda: clock[0]
     )
 
-    assert await client.state_read() == {"ok": 1}
-    client._ws._incoming.append(_WSMsg(msg_type=aiohttp.WSMsgType.CLOSED))
     with pytest.raises(CannotConnect):
         await client.state_read()
-
-    # Second rejection inside the cooldown window: no further login, latch instead.
-    with pytest.raises(InvalidAuth):
+    clock[0] += 1199
+    with pytest.raises(CannotConnect, match="waiting"):
         await client.state_read()
+    clock[0] += 1
+    assert await client.state_read() == {"ok": 1}
+
+    assert client.login.await_count == 2
+    assert client._session_stale is False
+    assert client._relogin_cooldown == 600
+
+
+@pytest.mark.asyncio
+async def test_repeated_timeouts_trigger_relogin(session, monkeypatch):
+    client = _client_with_credentials(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    monkeypatch.setattr(
+        "custom_components.securecontrols_thermostat.api.WS_RESPONSE_TIMEOUT_SECS", 0.01
+    )
+    calls = _patch_websockets(
+        monkeypatch, [FakeWS(), FakeWS(), FakeWS(), FakeWS([{"I": "corr", "R": {"ok": 1}}])]
+    )
+
+    for _ in range(3):
+        with pytest.raises(CannotConnect, match="timed out"):
+            await client.state_read()
+    client.login.assert_not_awaited()
+
+    assert await client.state_read() == {"ok": 1}
     client.login.assert_awaited_once()
-    assert client._auth_rejected is True
+    assert calls[3]["headers"]["Authorization"] == "Bearer jwt-fresh"
+    assert client._consecutive_timeouts == 0
+
+
+@pytest.mark.asyncio
+async def test_occasional_timeout_does_not_relogin(session, monkeypatch):
+    client = _client_with_credentials(session)
+    monkeypatch.setattr(SecureControlsClient, "_new_corr", lambda self: "corr")
+    monkeypatch.setattr(
+        "custom_components.securecontrols_thermostat.api.WS_RESPONSE_TIMEOUT_SECS", 0.01
+    )
+    _patch_websockets(
+        monkeypatch,
+        [FakeWS(), FakeWS([{"I": "corr", "R": {"ok": 1}}])],
+    )
+
+    with pytest.raises(CannotConnect):
+        await client.state_read()
+    assert await client.state_read() == {"ok": 1}
+    client.login.assert_not_awaited()
+    assert client._consecutive_timeouts == 0
 
 
 @pytest.mark.asyncio
