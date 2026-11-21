@@ -10,6 +10,7 @@ from homeassistant.components.climate.const import (
     PRESET_NONE,
 )
 from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -34,7 +35,7 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]  # single fixed mode
     _attr_preset_modes = ["away", "home"]
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
     _attr_target_temperature_step = 0.5
@@ -92,12 +93,12 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
         return None  # unknown during startup
 
     @property
-    def current_temperature(self) -> Optional[float]:
+    def native_current_temperature(self) -> Optional[float]:
         s = self.coordinator.data or {}
         return s.get("ambient_c")
 
     @property
-    def target_temperature(self) -> Optional[float]:
+    def native_target_temperature(self) -> Optional[float]:
         s = self.coordinator.data or {}
         return s.get("target_c")
 
@@ -115,10 +116,14 @@ class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity
     # ---------- Commands (no set_hvac_mode) ----------
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
+        current = self.native_current_temperature
+        if current is None:
+            raise HomeAssistantError("Current temperature is not known yet")
         if hvac_mode == HVACMode.HEAT:
-            await self.client.set_target_temp(self.current_temperature + 2.0)
+            await self.client.set_target_temp(current + 2.0)
         else:
-            await self.client.set_target_temp(self.current_temperature - 2.0)
+            await self.client.set_target_temp(current - 2.0)
+        await self.coordinator.async_request_refresh()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         if ATTR_TEMPERATURE in kwargs:
