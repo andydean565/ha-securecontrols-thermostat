@@ -89,12 +89,12 @@ Subprotocol:
 Polling still happens every 45 seconds, but over that one retained connection
 rather than a fresh socket each time.
 
-When Beanbag drops or expires the session (the socket goes quiet, or a
-reconnect is answered with `C=203 EC=2`), the integration signs in once more
-with the stored credentials and retries. At most one such automatic re-login
-happens every 10 minutes, so it can never hammer the account. If the fresh
-session is rejected too, or the credentials themselves are refused, the
-integration stops making cloud requests and Home Assistant shows a
+When Beanbag drops or expires the session (a reconnect is answered with
+`C=203 EC=2`, or three polls in a row get no reply), the integration signs in
+again with the stored credentials and retries. If the new session fails too,
+it waits and tries again, doubling the wait from 10 minutes up to an hour, and
+recovers on its own once Beanbag is answering again. It only stops for good
+when Beanbag refuses the password itself; Home Assistant then shows a
 **Re-authenticate** prompt under **Settings → Devices & services**.
 
 Opening the Secure Controls mobile app can invalidate Home Assistant's session;

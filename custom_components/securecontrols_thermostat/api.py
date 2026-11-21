@@ -30,10 +30,14 @@ HTTP_OK = 200
 HTTP_SERVER_ERROR = 500
 AUTH_ERROR_CODE = 203
 AUTH_ERROR_SUBCODE = 2
-# Minimum gap between automatic re-logins after Beanbag drops a session. One
-# login with already-accepted credentials per window cannot trip the account
-# lockout, which is triggered by repeated rejected logins.
+# Gap between automatic re-logins after Beanbag drops a session. It doubles
+# after each re-login whose new session still fails, up to the cap, and resets
+# once a request succeeds. Logins with already-accepted credentials cannot trip
+# the account lockout, which is triggered by repeated rejected logins.
 RELOGIN_COOLDOWN_SECS = 600
+RELOGIN_COOLDOWN_MAX_SECS = 3600
+# Consecutive response timeouts after which the session is treated as dead.
+MAX_CONSECUTIVE_TIMEOUTS = 3
 
 # Thermostat "block" constants (per your usage)
 THERMO_HI_WRITE = 2  # thermostat.state.write
@@ -178,6 +182,11 @@ class SecureControlsClient:
         # bounded re-login when Beanbag expires or drops the session.
         self._credentials: tuple[str, str] | None = None
         self._last_relogin: float | None = None
+        self._relogin_cooldown = RELOGIN_COOLDOWN_SECS
+        # Set when Beanbag rejects the session or it stops answering; cleared
+        # by the next successful request.
+        self._session_stale = False
+        self._consecutive_timeouts = 0
 
     # --------------- Utilities ---------------
     @staticmethod
@@ -367,36 +376,76 @@ class SecureControlsClient:
                     "Beanbag authentication was rejected; reload the integration to sign in again"
                 )
 
-            try:
-                return await self._transact(hi=hi, si=si, args=args)
-            except SessionRejected as err:
+            relogged = False
+            if self._session_stale:
                 if not self._may_relogin():
+                    raise CannotConnect(
+                        "Beanbag session is unavailable; waiting before signing in again"
+                    )
+                await self._relogin()
+                relogged = True
+
+            try:
+                result = await self._transact(hi=hi, si=si, args=args)
+            except SessionRejected as err:
+                if self._credentials is None:
+                    # Nothing to sign in with; only a reload can recover.
                     self._auth_rejected = True
                     raise InvalidAuth(
                         "Beanbag session was rejected; reload the integration to sign in again"
                     ) from err
+                self._session_stale = True
+                if relogged:
+                    self._back_off_relogin()
+                    raise CannotConnect(
+                        "Beanbag rejected the new session; will sign in again in "
+                        f"{self._relogin_cooldown // 60} minutes"
+                    ) from err
+                if not self._may_relogin():
+                    raise CannotConnect(
+                        "Beanbag session was rejected; waiting before signing in again"
+                    ) from err
                 _LOGGER.info("SecureControls: session rejected (%s); signing in again", err)
                 await self._relogin()
+                try:
+                    result = await self._transact(hi=hi, si=si, args=args)
+                except SessionRejected as retry_err:
+                    self._back_off_relogin()
+                    raise CannotConnect(
+                        "Beanbag rejected the new session too; will sign in again in "
+                        f"{self._relogin_cooldown // 60} minutes"
+                    ) from retry_err
+            except CannotConnect as err:
+                if isinstance(err.__cause__, TimeoutError):
+                    self._consecutive_timeouts += 1
+                    if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                        _LOGGER.info(
+                            "SecureControls: %s timeouts in a row; treating session as dead",
+                            self._consecutive_timeouts,
+                        )
+                        self._session_stale = True
+                raise
 
-            try:
-                return await self._transact(hi=hi, si=si, args=args)
-            except SessionRejected as err:
-                self._auth_rejected = True
-                raise InvalidAuth(
-                    "Beanbag rejected a freshly issued session; reload the integration"
-                ) from err
+            self._session_stale = False
+            self._consecutive_timeouts = 0
+            self._relogin_cooldown = RELOGIN_COOLDOWN_SECS
+            return result
+
+    def _back_off_relogin(self) -> None:
+        self._relogin_cooldown = min(self._relogin_cooldown * 2, RELOGIN_COOLDOWN_MAX_SECS)
 
     def _may_relogin(self) -> bool:
         if self._credentials is None:
             return False
         if self._last_relogin is None:
             return True
-        return time.monotonic() - self._last_relogin >= RELOGIN_COOLDOWN_SECS
+        return time.monotonic() - self._last_relogin >= self._relogin_cooldown
 
     async def _relogin(self) -> None:
         """Fresh login with the last accepted credentials (caller holds the lock).
 
-        login() itself latches the client if the credentials are now rejected.
+        login() itself latches the client if the credentials are now rejected;
+        that is the only path that stops requests for good.
         """
         assert self._credentials is not None
         self._last_relogin = time.monotonic()
@@ -404,6 +453,7 @@ class SecureControlsClient:
         if stale is not None:
             await self._close_websocket(stale)
         email, password = self._credentials
+        self._consecutive_timeouts = 0
         await self.login(email, password)
 
     async def _transact(self, *, hi: int, si: int, args: list[Any] | None) -> Any:
